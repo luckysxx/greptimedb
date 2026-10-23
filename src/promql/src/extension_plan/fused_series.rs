@@ -331,8 +331,6 @@ impl UserDefinedLogicalNodeCore for FusedSeries {
     }
 
     fn inputs(&self) -> Vec<&LogicalPlan> {
-        // No input is an empty child list, which is what tells the physical planner there is no
-        // scan to resolve.
         self.input.iter().collect()
     }
 
@@ -1053,8 +1051,6 @@ impl ExecutionPlan for FusedSeriesExec {
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
-        // A tree that reads no raw samples has no child at all, which is what tells the planner
-        // there is no scan to plan below this node.
         self.input.iter().collect()
     }
 

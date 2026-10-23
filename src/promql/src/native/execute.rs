@@ -2971,8 +2971,8 @@ impl NativeExecutionState {
                 // kind at one stage.
                 NativeExpr::Aggregate { .. } => NodeTag::Aggregate,
                 NativeExpr::Vector { .. } => NodeTag::Vector,
-                // A scalar is a value node: it produces the constant it was bound to, hands over no
-                // chunk and holds no state, so it is built like any other node and pulled like none.
+                // A constant root materializes its value on the grid once; a broadcast reads the
+                // binding instead of pulling the scalar node.
                 NativeExpr::Scalar(_) => NodeTag::Scalar,
             };
             let buffer = NodeBuffer::new(&path, handles, &pool);

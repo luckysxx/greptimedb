@@ -33,9 +33,12 @@ operators. Statement-to-plan translation lives in `src/query/src/promql/`.
   or unsupported shapes fall back to the existing planner. The supported subset
   requires one selector, a direct scan with a bound metric name, and no residual
   label matchers or `__field__` matcher that narrows the scan, plus an eligible
-  raw-series table/field set and supported expression/grid. Metric scans retain
-  the static `__table_id` predicate. Hybrid CTEs and CREATE VIEW TQL creation
-  currently fall back to the existing planner.
+  raw-series table/field set and supported expression/grid. A statement with no
+  selector is the one exception: when its expression folds to a constant,
+  `native_compile::compile_statement` binds that value on the statement grid and
+  the node carries no child, so no scan and no metric name are bound. Metric
+  scans retain the static `__table_id` predicate. Hybrid CTEs and CREATE VIEW
+  TQL creation currently fall back to the existing planner.
 
 ## Change coupling
 
