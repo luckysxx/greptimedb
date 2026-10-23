@@ -16,9 +16,11 @@
 //!
 //! [`PromPlanner::try_plan_native_fused`] offers a whole statement expression to the native
 //! compiler and, when the compiler accepts it, replaces everything the existing path would plan
-//! below the root with one [`FusedSeries`] node over the selector's own table scan. Declining is
-//! the normal answer: every shape the compiler does not accept, and every query this route cannot
-//! bind to a scan faithfully, keeps the plan the existing planner builds.
+//! below the root with one [`FusedSeries`] node over the selector's own table scan. A tree that folds
+//! across series - an aggregate - is split instead: its per-series prefix runs in a `FusedSeries`
+//! producer and an [`AggregateFinalize`] merges the state every partition exports. Declining is the
+//! normal answer: every shape the compiler does not accept, and every query this route cannot bind to
+//! a scan faithfully, keeps the plan the existing planner builds.
 //!
 //! What the node needs from here is three things the existing planner already resolves: the raw
 //! series schema the tree's input was compiled against (the selector's selected field columns), the
@@ -38,8 +40,7 @@ use datafusion::logical_expr::{Extension, LogicalPlan, TableScanBuilder};
 use datafusion_expr::Expr;
 use datatypes::series::SeriesOrdering;
 use datatypes::series::samples::{FieldSpec, SeriesSchema};
-use promql::extension_plan::{FusedSeries, FusedSeriesBinding};
-use promql::native::plan::reads_across_series;
+use promql::extension_plan::{AggregateFinalize, FusedSeries, FusedSeriesBinding};
 use promql_parser::parser::value::ValueType;
 use promql_parser::parser::{
     EvalStmt, Expr as PromExpr, MatrixSelector, ParenExpr, VectorSelector,
@@ -51,6 +52,7 @@ use store_api::metric_engine_consts::{DATA_SCHEMA_TABLE_ID_COLUMN_NAME, METRIC_E
 use crate::promql::error::{DataFusionPlanningSnafu, Result};
 use crate::promql::native_compile::{compile, statement_grid};
 use crate::promql::planner::PromPlanner;
+use crate::query_engine::QueryEngineState;
 
 /// The query-context key that turns the native fused-series route on for one query.
 ///
@@ -89,7 +91,12 @@ pub(crate) fn native_promql_requested(query_ctx: &QueryContextRef) -> bool {
 const NATIVE_ORDERING: SeriesOrdering = SeriesOrdering::Contiguous;
 
 impl PromPlanner {
-    /// Plans `prom_expr` as one [`FusedSeries`] node, or returns `None` to keep the existing plan.
+    /// Plans `prom_expr` as one native node, or returns `None` to keep the existing plan.
+    ///
+    /// `query_engine_state` is only read to build the *existing* plan of an aggregate query, whose
+    /// column names and grouped labels are what the rows of a split aggregate are named after. That
+    /// plan is built for its schema, its names are copied, and it is dropped: it is never executed
+    /// and never stored, so the batch that answers the query is the native route's own.
     ///
     /// The route is offered a whole expression because the compiler folds a range function and the
     /// math functions over it into one tree: offering a sub-expression instead would compile a tree
@@ -107,6 +114,7 @@ impl PromPlanner {
     pub(super) async fn try_plan_native_fused(
         &mut self,
         prom_expr: &PromExpr,
+        query_engine_state: &QueryEngineState,
     ) -> Result<Option<LogicalPlan>> {
         if !self.native_fused {
             return Ok(None);
@@ -297,15 +305,6 @@ impl PromPlanner {
             Err(DataFusionError::NotImplemented(_)) => return Ok(None),
             Err(error) => return Err(error).context(DataFusionPlanningSnafu),
         };
-        // A vector operation (`sort`, `absent`, `topk`, `histogram_quantile`, ...) reads the whole
-        // vector at each grid point rather than one series at a time, so it cannot be evaluated by
-        // one executor per scan partition. Declining here is the only place that still works: once
-        // the `FusedSeries` node exists the logical plan is fixed, and the categorizer merely
-        // declining to push it down would leave a node the physical layer must build anyway.
-        if reads_across_series(tree.root()) {
-            return Ok(None);
-        }
-
         let binding = FusedSeriesBinding {
             series_schema,
             // The tree's own output is evaluated on the statement's grid, and the binding names
@@ -316,15 +315,57 @@ impl PromPlanner {
             time_index: time_index.clone(),
             tags: tags.clone(),
         };
-        let output_schema = fused_output_schema(&fields, &tags, &time_index)?;
-        let node = FusedSeries::try_new(
+        // A tree that answers one series from one series' samples runs whole, in one node.
+        if !promql::native::plan::reads_across_series(tree.root()) {
+            let output_schema = fused_output_schema(&fields, &tags, &time_index)?;
+            let node = FusedSeries::try_new(
+                Arc::from(prom_expr.to_string()),
+                tree,
+                binding,
+                input,
+                output_schema,
+            )
+            .context(DataFusionPlanningSnafu)?;
+            return Ok(Some(LogicalPlan::Extension(Extension {
+                node: Arc::new(node),
+            })));
+        }
+
+        // A `Complete` aggregate folds every contribution to a group, and one partition holds only
+        // part of one, so the tree is split: the aggregate's per-series prefix runs in the region and
+        // exports the state it folded, and `AggregateFinalize` merges that state here. A tree the
+        // split cannot carry is declined here, before anything else is planned for it.
+        if !AggregateFinalize::can_split(&tree, &binding.series_schema.fields, &binding.time_index)
+        {
+            return Ok(None);
+        }
+
+        // The rows have to be named the way the existing plan names them, which is read off a legacy
+        // plan built for its schema only - it is never stored or run - and the context is restored
+        // afterwards.
+        let saved = self.ctx.clone();
+        let planned = self
+            .prom_root_expr_to_plan(prom_expr, query_engine_state)
+            .await;
+        let legacy_fields = self.ctx.field_columns.clone();
+        let legacy_tags = self.ctx.tag_columns.clone();
+        self.ctx = saved;
+        // Only its schema mattered, so the plan is dropped here rather than stored.
+        drop(planned?);
+        let output_schema = fused_output_schema(&legacy_fields, &legacy_tags, &time_index)?;
+        let node = match AggregateFinalize::try_new(
             Arc::from(prom_expr.to_string()),
             tree,
             binding,
             input,
             output_schema,
-        )
-        .context(DataFusionPlanningSnafu)?;
+        ) {
+            Ok(node) => node,
+            // The split refusing a shape is this route declining it, exactly as the compiler
+            // refusing one is: the existing plan is the answer.
+            Err(DataFusionError::NotImplemented(_)) => return Ok(None),
+            Err(error) => return Err(error).context(DataFusionPlanningSnafu),
+        };
 
         Ok(Some(LogicalPlan::Extension(Extension {
             node: Arc::new(node),
@@ -394,12 +435,7 @@ fn fused_output_schema(
     ))
 }
 
-/// The one selector `expr` folds, if it names exactly one.
-///
-/// The walk follows the grammar the native compiler accepts — a call, a range selector, a selector
-/// and parentheses — and stops at every other shape, because a shape the compiler cannot compile
-/// needs no selector resolved. Two distinct selectors are not one input, and a tree built over the
-/// wrong one of them would evaluate a window the query did not write.
+/// The range selector's duration, if `expr` contains one.
 fn selector_range_millis(expr: &PromExpr) -> Option<i64> {
     match expr {
         PromExpr::MatrixSelector(matrix) => Some(matrix.range.as_millis() as i64),
@@ -409,6 +445,7 @@ fn selector_range_millis(expr: &PromExpr) -> Option<i64> {
             .args
             .iter()
             .find_map(|arg| selector_range_millis(arg)),
+        PromExpr::Aggregate(aggregate) => selector_range_millis(&aggregate.expr),
         _ => None,
     }
 }
@@ -480,6 +517,11 @@ fn collect_selectors<'a>(expr: &'a PromExpr, out: &mut Vec<&'a VectorSelector>) 
                 collect_selectors(arg, out);
             }
         }
+        // An aggregate folds its input's series, so the selector is the one its input names.
+        // `param` is not descended into: an aggregate's parameter has to be a constant for the
+        // compiler to bind it, and a parameter naming a second selector is refused there rather
+        // than planned against the wrong scan.
+        PromExpr::Aggregate(aggregate) => collect_selectors(&aggregate.expr, out),
         _ => {}
     }
 }
@@ -490,7 +532,57 @@ mod tests {
 
     use session::context::QueryContextBuilder;
 
-    use super::{NATIVE_PROMQL_EXTENSION_KEY, native_promql_requested};
+    use super::{
+        NATIVE_PROMQL_EXTENSION_KEY, native_promql_requested, selector_range_millis,
+        single_selector,
+    };
+
+    fn expr(query: &str) -> promql_parser::parser::Expr {
+        promql_parser::parser::parse(query).expect("the query parses")
+    }
+
+    #[test]
+    fn selector_range_follows_aggregate_input() {
+        for (query, expected) in [
+            ("sum(count_over_time(x[10m]))", Some(600_000)),
+            ("sum(rate(x[10m] offset 1m))", Some(600_000)),
+            ("sum(rate(x[10m] @ 600))", Some(600_000)),
+            ("sum(x)", None),
+        ] {
+            assert_eq!(selector_range_millis(&expr(query)), expected, "{query}");
+        }
+    }
+
+    /// An aggregate's selector is the one its input names, so the route can offer it at all.
+    #[test]
+    fn an_aggregate_offers_the_selector_of_its_input() {
+        for query in [
+            "sum(x)",
+            "sum by (job) (x)",
+            "sum without (instance) (rate(x[5m]))",
+            "avg(ceil(x))",
+        ] {
+            assert!(
+                single_selector(&expr(query)).is_some(),
+                "`{query}` names one selector"
+            );
+        }
+    }
+
+    /// A shape naming two selectors is still declined, however it is written.
+    #[test]
+    fn a_shape_naming_two_selectors_is_declined() {
+        for query in [
+            "sum(a) / sum(b)",
+            "sum(a + b)",
+            "sum by (job) (rate(a[5m])) + sum by (job) (rate(b[5m]))",
+        ] {
+            assert!(
+                single_selector(&expr(query)).is_none(),
+                "`{query}` names two selectors"
+            );
+        }
+    }
 
     #[test]
     fn native_promql_requested_is_false_when_extension_is_absent() {

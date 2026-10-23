@@ -53,6 +53,7 @@ use frontend::instance::builder::FrontendBuilder;
 use frontend::server::Services;
 use frontend::service_config::{BatcherOptions, PendingRowsBatcherOptions};
 use meta_srv::metasrv::{FLOW_ID_SEQ, TABLE_ID_SEQ};
+use query::options::QueryOptions;
 use servers::grpc::GrpcOptions;
 use standalone::options::StandaloneOptions;
 use standalone::{StandaloneDatanodeManager, StandaloneRepartitionProcedureFactory};
@@ -91,7 +92,7 @@ pub struct GreptimeDbStandaloneBuilder {
     logical_batcher: Option<BatcherOptions>,
     table_batcher: BatcherOptions,
     mito_config: Option<mito2::config::MitoConfig>,
-    query_options: query::options::QueryOptions,
+    query_options: QueryOptions,
 }
 
 impl GreptimeDbStandaloneBuilder {
@@ -113,21 +114,26 @@ impl GreptimeDbStandaloneBuilder {
             logical_batcher: None,
             table_batcher: BatcherOptions::default(),
             mito_config: None,
-            query_options: query::options::QueryOptions::default(),
+            query_options: QueryOptions::default(),
         }
-    }
-
-    /// Overrides query options for this standalone test instance.
-    #[must_use]
-    pub fn with_query_options(mut self, options: query::options::QueryOptions) -> Self {
-        self.query_options = options;
-        self
     }
 
     /// Overrides the Mito configuration for this test instance.
     #[must_use]
     pub fn with_mito_config(mut self, config: mito2::config::MitoConfig) -> Self {
         self.mito_config = Some(config);
+        self
+    }
+
+    /// Overrides the query engine options handed to the standalone bootstrap.
+    ///
+    /// The options reach the instance the same way the real `standalone start` hands them over: as
+    /// the `query` section of [`StandaloneOptions`]. A test uses this to turn on an experimental
+    /// route for its own instance only, so enabling it here never changes the production
+    /// bootstrap.
+    #[must_use]
+    pub fn with_query_options(mut self, options: QueryOptions) -> Self {
+        self.query_options = options;
         self
     }
 
@@ -325,6 +331,9 @@ impl GreptimeDbStandaloneBuilder {
             procedure_executor.clone(),
             Arc::new(ProcessManager::new(server_addr, None)),
         )
+        // The regions this frontend reads are served by the datanode it was just built with, in
+        // this process, so a region input travels as a logical plan instead of Substrait bytes.
+        // This is the transport the real standalone bootstrap declares.
         .with_in_process_region_transport()
         .with_local_file_access(local_file_access)
         .with_plugin(plugins.clone())
@@ -399,11 +408,13 @@ impl GreptimeDbStandaloneBuilder {
             slow_query: self.slow_query_options.clone(),
             event_recorder: self.event_recorder_options.clone(),
             auto_create_table: self.auto_create_table,
-            query: self.query_options.clone(),
             pending_rows_batcher: PendingRowsBatcherOptions {
                 logical_table: self.logical_batcher.clone(),
                 table: self.table_batcher.clone(),
             },
+            // The query engine options this test asked for, in the same place the real bootstrap
+            // reads them from.
+            query: self.query_options.clone(),
             // Tests cover the descriptor, so they run with it enabled.
             otlp: frontend::service_config::OtlpOptions {
                 experimental_enable_resource_info: true,
