@@ -363,9 +363,15 @@ pub fn reads_across_series(node: &NativeNode) -> bool {
         NativeExpr::Instant { input, .. }
         | NativeExpr::Window { input, .. }
         | NativeExpr::Map { input, .. } => reads_across_series(input),
-        NativeExpr::Aggregate { .. } | NativeExpr::Binary { .. } | NativeExpr::Vector { .. } => {
-            true
-        }
+        // A vector/vector operation pairs series. With either scalar side, recurse through both
+        // operands so a future scalar dependency that reads across series is not skipped.
+        NativeExpr::Binary { left, right, .. } => match (&left.output, &right.output) {
+            (NativeType::Scalar(_), _) | (_, NativeType::Scalar(_)) => {
+                reads_across_series(left) || reads_across_series(right)
+            }
+            _ => true,
+        },
+        NativeExpr::Aggregate { .. } | NativeExpr::Vector { .. } => true,
     }
 }
 

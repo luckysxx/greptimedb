@@ -56,8 +56,9 @@ use datafusion::physical_optimizer::ensure_requirements::EnsureRequirements;
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::metrics::{ExecutionPlanMetricsSet, MetricValue, MetricsSet};
 use datafusion::physical_plan::{
-    DisplayAs, DisplayFormatType, Distribution, ExecutionPlan, Partitioning, PlanProperties,
-    RecordBatchStream, SendableRecordBatchStream, collect, displayable,
+    ChildrenPropertiesMode, DisplayAs, DisplayFormatType, Distribution, ExecutionPlan,
+    Partitioning, PlanProperties, RecordBatchStream, ReplaceChildrenOptions,
+    SendableRecordBatchStream, collect, displayable,
 };
 use datafusion::prelude::SessionContext;
 use datatypes::series::frame::{RawLabelMode, pack_raw_series_chunk, raw_series_frame_schema};
@@ -69,19 +70,18 @@ use futures::{Stream, StreamExt, TryStreamExt};
 use store_api::region_engine::RawLabelSource;
 
 use super::{
-    FusedExecInput, FusedSeries, FusedSeriesBinding, FusedSeriesStream, LabelSets, OutputColumn,
-    POLL_BUDGET, classify_output, label_set, occupied_runs, open_raw_series, series_stream,
-    series_to_record_batch,
+    FusedExecInput, FusedSeries, FusedSeriesBinding, FusedSeriesExec, LabelSets, OutputColumn,
+    POLL_BUDGET, label_set, occupied_runs, series_to_record_batch,
 };
 use crate::evaluated::EvaluatedChunk;
 use crate::native::execute::{NativeExecutionState, NativeExecutor};
-use crate::native::metrics::NodePath;
 use crate::native::plan::{
     AggregateKind, AggregateStage, BoundAggregate, BoundInput, BoundInstant, BoundScalar,
     BoundWindow, Grouping, NativeExpr, NativeNode, NativeTree, NativeType,
 };
 use crate::native::runs::absorb_rebuilds;
 use crate::range_eval::{RangeFunction, RangeWindow};
+use crate::vector_match::{BinaryMatching, BinaryOp, Cardinality, FillValues, MatchingLabels};
 
 /// The query every tree here is compiled from.
 const PROMQL: &str = "rate(x[5m])";
@@ -358,6 +358,37 @@ fn instant_tree() -> NativeTree {
     .expect("the bound tree is legal")
 }
 
+/// The `input * 100` or `-1 * input` broadcast used by the concurrent partition test.
+fn broadcast_tree(scalar: f64, unary: bool) -> NativeTree {
+    let instant = instant_tree().root().clone();
+    let output = instant.output.clone();
+    let literal = NativeNode {
+        expr: NativeExpr::Scalar(BoundScalar { value: scalar }),
+        output: NativeType::Scalar(grid()),
+    };
+    let (left, right, op) = if unary {
+        (literal, instant, BinaryOp::Mul)
+    } else {
+        (instant, literal, BinaryOp::Mul)
+    };
+    let matching = BinaryMatching {
+        op,
+        return_bool: false,
+        labels: MatchingLabels::Ignoring(Vec::new()),
+        cardinality: Cardinality::OneToOne,
+        fill: FillValues::default(),
+    };
+    NativeTree::try_new(NativeNode {
+        expr: NativeExpr::Binary {
+            left: Box::new(left),
+            right: Box::new(right),
+            matching,
+        },
+        output,
+    })
+    .expect("literal broadcast tree is valid")
+}
+
 /// What the tree's input was compiled against, for the input schema and output tags given.
 fn binding_of(
     tree: &NativeTree,
@@ -459,10 +490,19 @@ fn staged(
     schema: SchemaRef,
     make: impl Fn() -> SendableRecordBatchStream + Send + Sync + 'static,
 ) -> Arc<dyn ExecutionPlan> {
+    staged_partitioned(schema, 1, move |_| make())
+}
+
+/// A physical input whose partition `make` builds.
+fn staged_partitioned(
+    schema: SchemaRef,
+    partitions: usize,
+    make: impl Fn(usize) -> SendableRecordBatchStream + Send + Sync + 'static,
+) -> Arc<dyn ExecutionPlan> {
     Arc::new(StagedPlan {
         properties: Arc::new(PlanProperties::new(
             EquivalenceProperties::new(schema),
-            Partitioning::UnknownPartitioning(1),
+            Partitioning::UnknownPartitioning(partitions),
             EmissionType::Incremental,
             Boundedness::Bounded,
         )),
@@ -473,7 +513,7 @@ fn staged(
 /// A physical input, so a test can stage what a memory source cannot: a pending poll, an error
 /// after some rows, and a stream whose drop it can see.
 struct StagedPlan {
-    make: Box<dyn Fn() -> SendableRecordBatchStream + Send + Sync>,
+    make: Box<dyn Fn(usize) -> SendableRecordBatchStream + Send + Sync>,
     properties: Arc<PlanProperties>,
 }
 
@@ -528,7 +568,7 @@ impl ExecutionPlan for StagedPlan {
                 "StagedPlan has no partition {partition}"
             )));
         }
-        Ok((self.make)())
+        Ok((self.make)(partition))
     }
 }
 
@@ -2887,6 +2927,75 @@ fn a_chunk_reaching_back_still_merges() {
     );
 }
 
+// ---- Concurrent per-partition input consumption ----------------------------------
+
+#[tokio::test]
+async fn four_partition_literal_broadcast_and_unary_read_concurrently() {
+    for (scalar, unary) in [(100.0, false), (-1.0, true)] {
+        let barrier = Arc::new(tokio::sync::Barrier::new(4));
+        let input = staged_partitioned(frame_schema(), 4, {
+            let barrier = Arc::clone(&barrier);
+            move |partition| {
+                let barrier = Arc::clone(&barrier);
+                let host = format!("h{partition}");
+                let batch = frame(&series_chunk(&host, &series_samples(1.0), true));
+                let schema = frame_schema();
+                let stream = futures::stream::once(async move {
+                    barrier.wait().await;
+                    Ok(batch)
+                });
+                Box::pin(
+                    datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(
+                        schema, stream,
+                    ),
+                )
+            }
+        });
+        let tree = broadcast_tree(scalar, unary);
+        let node = fused(tree);
+        let exec = node
+            .to_execution_plan(FusedExecInput::RawSeries {
+                input: input.clone(),
+                label_source: RawLabelSource::Explicit,
+                ordering: SeriesOrdering::Contiguous,
+            })
+            .expect("four partition input plans");
+        assert_eq!(input.properties().partitioning.partition_count(), 4);
+        assert_eq!(exec.properties().partitioning.partition_count(), 4);
+        let requirements = exec.input_distribution_requirements().into_per_child();
+        assert_eq!(requirements.len(), 1);
+        assert!(matches!(
+            requirements[0],
+            Distribution::UnspecifiedDistribution
+        ));
+        let children = exec.children();
+        assert_eq!(children.len(), 1);
+        assert!(
+            Arc::ptr_eq(children[0], &input),
+            "no input exchange is inserted"
+        );
+        let task = task_context(&Arc::new(GreedyMemoryPool::new(1 << 20)));
+        let batches = tokio::time::timeout(std::time::Duration::from_secs(5), collect(exec, task))
+            .await
+            .expect("all four input streams reached the barrier")
+            .expect("the fused execution succeeds");
+        let mut actual = rows(&batches);
+        actual.sort_by(|left, right| (left.0, &left.2).cmp(&(right.0, &right.2)));
+        let times = grid().timestamps().unwrap().to_vec();
+        let mut expected = (0..4)
+            .flat_map(|partition| {
+                let host = Some(format!("h{partition}"));
+                times.iter().map(move |time| {
+                    let value = *time as f64 / 1000.0 * scalar;
+                    (*time, Some(value), host.clone(), None)
+                })
+            })
+            .collect::<Vec<_>>();
+        expected.sort_by(|left, right| (left.0, &left.2).cmp(&(right.0, &right.2)));
+        assert_eq!(actual, expected);
+    }
+}
+
 // ---- Scalar roots and trees that read no raw samples -------------------------------
 
 /// A scalar root that reads no raw samples at all.
@@ -2941,6 +3050,19 @@ fn scalar_node(tree: NativeTree) -> FusedSeries {
     .expect("a scalar tree needs no child")
 }
 
+/// The physical scalar node over `output_schema`, declaring `tags`: what [`scalar_node`] hands over,
+/// for the schemas a well-formed node never has.
+fn scalar_exec(output_schema: SchemaRef, tags: Vec<String>) -> DataFusionResult<FusedSeriesExec> {
+    FusedSeriesExec::try_new(
+        Arc::from("1 + 2"),
+        FusedExecInput::None,
+        Arc::new(scalar_tree(3.0)),
+        output_schema,
+        TIME.to_string(),
+        tags,
+    )
+}
+
 #[test]
 fn a_scalar_root_needs_no_child_and_reports_one_partition() {
     let node = scalar_node(scalar_tree(3.0));
@@ -2951,8 +3073,45 @@ fn a_scalar_root_needs_no_child_and_reports_one_partition() {
         .to_execution_plan(FusedExecInput::None)
         .expect("a scalar node plans");
     assert!(exec.children().is_empty());
+    assert!(
+        exec.input_distribution_requirements()
+            .into_per_child()
+            .is_empty(),
+        "a node with no child asks nothing of one"
+    );
     assert_eq!(exec.properties().partitioning.partition_count(), 1);
     assert!(exec.benefits_from_input_partitioning().iter().all(|b| !b));
+
+    // Rebuilt with the child count it was built with, the node stays childless; rebuilt with a
+    // child it never had, it is refused rather than planned over one.
+    let rebuilt_exec = Arc::clone(&exec)
+        .replace_children(
+            vec![],
+            ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+        )
+        .expect("a node with no child is rebuilt with none");
+    assert!(rebuilt_exec.children().is_empty());
+    let child = memory_exec(vec![frame(&series_chunk("h", &series_samples(1.0), true))]);
+    let error = Arc::clone(&exec)
+        .replace_children(
+            vec![child],
+            ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+        )
+        .expect_err("a node with no child is rebuilt with none");
+    assert!(
+        error.to_string().contains("rebuilt with 1 child"),
+        "{error}"
+    );
+
+    // Rebuilding the logical node holds the same arity: no child at all, and one is refused.
+    let rebuilt_node = node
+        .with_exprs_and_inputs(vec![], vec![])
+        .expect("a tree that reads nothing rebuilds with no child");
+    assert!(rebuilt_node.input().is_none());
+    let error = node
+        .with_exprs_and_inputs(vec![], vec![input_plan(frame_schema())])
+        .expect_err("a child the tree does not read is refused");
+    assert!(error.to_string().contains("rebuilt with 1"), "{error}");
 
     // Only the one partition exists, so any other is refused rather than answered empty.
     let context = task_context(&Arc::new(GreedyMemoryPool::new(1 << 20)));
@@ -3027,53 +3186,82 @@ fn a_scalar_root_with_a_child_is_refused_and_a_tree_with_a_child_needs_it() {
 
 #[test]
 fn the_scalar_output_schema_is_the_time_and_one_value() {
-    let classification = classify_output(&scalar_output_schema(), None, &[], TIME, true)
-        .expect("a scalar output is time and value");
+    let exec =
+        scalar_exec(scalar_output_schema(), vec![]).expect("a scalar output is time and value");
+    let classification = &exec.classification;
     assert_eq!(classification.len(), 2);
     assert!(matches!(classification[0], OutputColumn::Time));
-    assert!(matches!(classification[1], OutputColumn::Scalar));
+    assert!(
+        matches!(classification[1], OutputColumn::Field(0)),
+        "a scalar's value is the series schema's single field"
+    );
 }
 
 #[test]
 fn the_scalar_output_schema_refuses_labels_fields_and_a_second_value() {
+    /// A timestamp column that the output can report positions in.
+    fn time_field() -> Field {
+        Field::new(
+            TIME,
+            DataType::Timestamp(TimeUnit::Millisecond, None),
+            false,
+        )
+    }
+
+    // A tag has nowhere to live: a scalar carries no labels.
+    let error = scalar_exec(
+        Arc::new(Schema::new(vec![
+            time_field(),
+            Field::new(HOST, DataType::Utf8, true),
+        ])),
+        vec![HOST.to_string()],
+    )
+    .expect_err("a scalar output has no room for a tag");
+    assert!(error.to_string().contains("no tags"), "{error}");
+
+    // Two columns claim the time column.
+    let error = scalar_exec(
+        Arc::new(Schema::new(vec![
+            time_field(),
+            Field::new(VALUE, DataType::Float64, true),
+            time_field(),
+        ])),
+        vec![],
+    )
+    .expect_err("a scalar output has one time column");
+    assert!(
+        error.to_string().contains("duplicate time column"),
+        "{error}"
+    );
+
+    // The value column is a nullable Float64, like a series field.
     for (field, expected) in [
-        (Field::new(HOST, DataType::Utf8, true), "no tags"),
-        (
-            Field::new(
-                TIME,
-                DataType::Timestamp(TimeUnit::Millisecond, None),
-                false,
-            ),
-            "duplicate time column",
-        ),
         (Field::new(VALUE, DataType::Int64, true), "must be Float64"),
+        (
+            Field::new(VALUE, DataType::Float64, false),
+            "must be nullable",
+        ),
     ] {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new(
-                TIME,
-                DataType::Timestamp(TimeUnit::Millisecond, None),
-                false,
-            ),
-            field,
-        ]));
-        let tags: Vec<String> = if expected == "no tags" {
-            vec![HOST.to_string()]
-        } else {
-            vec![]
-        };
-        let error = classify_output(&schema, None, &tags, TIME, true)
-            .expect_err("a scalar output has no room for this column");
+        let error = scalar_exec(Arc::new(Schema::new(vec![time_field(), field])), vec![])
+            .expect_err("a scalar's value is a nullable Float64");
         assert!(error.to_string().contains(expected), "{error}");
     }
 
+    // A second value column is refused: a scalar answers one value per grid point.
+    let error = scalar_exec(
+        Arc::new(Schema::new(vec![
+            time_field(),
+            Field::new(VALUE, DataType::Float64, true),
+            Field::new(OTHER, DataType::Float64, true),
+        ])),
+        vec![],
+    )
+    .expect_err("a scalar has one value per grid point");
+    assert!(error.to_string().contains("second value column"), "{error}");
+
     // A missing value column is refused too: a time-only output reports positions, not values.
-    let schema = Arc::new(Schema::new(vec![Field::new(
-        TIME,
-        DataType::Timestamp(TimeUnit::Millisecond, None),
-        false,
-    )]));
-    let error =
-        classify_output(&schema, None, &[], TIME, true).expect_err("a scalar needs a value column");
+    let error = scalar_exec(Arc::new(Schema::new(vec![time_field()])), vec![])
+        .expect_err("a scalar needs a value column");
     assert!(
         error.to_string().contains("missing value column"),
         "{error}"
@@ -3088,217 +3276,4 @@ fn grid_rows() -> Vec<i64> {
         .iter()
         .copied()
         .collect()
-}
-
-// ---- Fan-in: one execution reading every child partition ----------------------------
-
-/// The production driver over `partitions` of `child`, running a samples `tree`.
-///
-/// It is [`open_raw_series`] and [`FusedSeriesStream`] - the same code the node runs - with a tree
-/// that produces samples: fetching partitions, deciding when the whole input ended and reporting a
-/// partition's error do not depend on the root's type, so an ordinary tree is what proves them.
-fn fan_in_stream(
-    tree: &NativeTree,
-    child: &Arc<dyn ExecutionPlan>,
-    partitions: Vec<usize>,
-    context: &Arc<TaskContext>,
-) -> DataFusionResult<FusedSeriesStream> {
-    let tags = [HOST.to_string(), NAME.to_string()];
-    let classification =
-        classify_output(&output_schema(), Some(&raw_schema()), &tags, TIME, false)?;
-    let input = open_raw_series(child, partitions, Some(Arc::clone(&raw_schema())), context)?;
-    // The production constructor, not a copy of its field list: attaching the label sets to the
-    // task's pool and ending an empty input are what the node does, so a test that built the stream
-    // by hand would be testing itself.
-    series_stream(
-        &Arc::new(tree.clone()),
-        0,
-        &ExecutionPlanMetricsSet::new(),
-        input,
-        Some(NodePath::root().input()),
-        classification.into(),
-        tags.into(),
-        output_schema(),
-        Arc::new(std::sync::Mutex::new(LabelSets::default())),
-        context,
-    )
-}
-
-/// Both partitions' series reach the one runtime, and the answer is not one series per partition.
-#[test]
-fn a_fan_in_reads_every_partition_into_one_runtime() {
-    let tree = rate_tree();
-    let samples = series_samples(1.0);
-    let child = memory_exec_partitioned(vec![
-        vec![frame(&series_chunk("h1", &samples, true))],
-        vec![frame(&series_chunk("h2", &samples, true))],
-    ]);
-    let context = task_context(&Arc::new(GreedyMemoryPool::new(1 << 20)));
-
-    let stream = fan_in_stream(&tree, &child, vec![0, 1], &context).expect("the fan-in opens");
-    let batches: Vec<RecordBatch> =
-        futures::executor::block_on(stream.try_collect()).expect("the fan-in runs");
-
-    let hosts = rows(&batches)
-        .into_iter()
-        .filter_map(|(_, _, host, _)| host)
-        .collect::<std::collections::BTreeSet<_>>();
-    assert_eq!(
-        hosts,
-        std::collections::BTreeSet::from(["h1".to_string(), "h2".to_string()]),
-        "one execution did not see both partitions' series"
-    );
-}
-
-/// One partition ending is not the end of the input: the later partition is still read.
-#[test]
-fn a_partition_ending_does_not_end_the_whole_input() {
-    let tree = rate_tree();
-    let samples = series_samples(1.0);
-    let child = memory_exec_partitioned(vec![
-        vec![frame(&series_chunk("h1", &samples, true))],
-        vec![frame(&series_chunk("h2", &samples, true))],
-    ]);
-    let context = task_context(&Arc::new(GreedyMemoryPool::new(1 << 20)));
-    let stream = fan_in_stream(&tree, &child, vec![0, 1], &context).expect("the fan-in opens");
-    let batches: Vec<RecordBatch> =
-        futures::executor::block_on(stream.try_collect()).expect("the fan-in runs");
-
-    // The first partition closed its series on the first stream. If that had ended the input, the
-    // window would have been flushed before the second series arrived and only `h1` would be here.
-    let hosts = rows(&batches)
-        .into_iter()
-        .filter_map(|(_, _, host, _)| host)
-        .collect::<std::collections::BTreeSet<_>>();
-    assert!(
-        hosts.contains("h2"),
-        "the input ended with the first partition: {hosts:?}"
-    );
-}
-
-/// A partition's failure is reported as an error, never as the end of the input.
-#[test]
-fn a_partition_error_is_not_a_normal_end() {
-    let tree = rate_tree();
-    let samples = series_samples(1.0);
-    let good = vec![frame(&series_chunk("h1", &samples, true))];
-    let child = partitioned_with_error(good);
-    let context = task_context(&Arc::new(GreedyMemoryPool::new(1 << 20)));
-    let mut stream = fan_in_stream(&tree, &child, vec![0, 1], &context).expect("the fan-in opens");
-
-    let mut answered = Vec::new();
-    let error = loop {
-        match futures::executor::block_on(stream.next()) {
-            Some(Ok(batch)) => answered.push(batch),
-            Some(Err(error)) => break error,
-            None => panic!(
-                "the failing partition ended the stream as if it were complete: {:?}",
-                rows(&answered)
-            ),
-        }
-    };
-    assert!(
-        error.to_string().contains("partition 1"),
-        "the error did not name the failing partition: {error}"
-    );
-}
-
-/// A source of `partitions` where every partition in `failing` ends with an error instead of data.
-fn partitioned_with_error(good: Vec<RecordBatch>) -> Arc<dyn ExecutionPlan> {
-    Arc::new(FailingPartitionPlan {
-        schema: frame_schema(),
-        good,
-    })
-}
-
-/// A source of two partitions, the second of which ends with an error and no batch.
-///
-/// Two partitions is what a fan-in has to read: the error has to surface while the other partition
-/// still had data, so that "the stream ended" and "a partition failed" cannot be confused.
-struct FailingPartitionPlan {
-    schema: SchemaRef,
-    good: Vec<RecordBatch>,
-}
-
-impl std::fmt::Debug for FailingPartitionPlan {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        f.debug_struct("FailingPartitionPlan").finish()
-    }
-}
-
-impl DisplayAs for FailingPartitionPlan {
-    fn fmt_as(&self, _t: DisplayFormatType, f: &mut Formatter<'_>) -> fmt::Result {
-        write!(f, "FailingPartitionPlan")
-    }
-}
-
-impl ExecutionPlan for FailingPartitionPlan {
-    fn name(&self) -> &str {
-        "FailingPartitionPlan"
-    }
-
-    fn properties(&self) -> &Arc<PlanProperties> {
-        static PROPERTIES: std::sync::OnceLock<Arc<PlanProperties>> = std::sync::OnceLock::new();
-        PROPERTIES.get_or_init(|| {
-            Arc::new(PlanProperties::new(
-                EquivalenceProperties::new(frame_schema()),
-                Partitioning::UnknownPartitioning(2),
-                EmissionType::Incremental,
-                Boundedness::Bounded,
-            ))
-        })
-    }
-
-    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
-        vec![]
-    }
-
-    fn apply_expressions(
-        &self,
-        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DataFusionResult<TreeNodeRecursion>,
-    ) -> DataFusionResult<TreeNodeRecursion> {
-        // The source holds no expression of its own.
-        Ok(TreeNodeRecursion::Continue)
-    }
-
-    fn with_new_children(
-        self: Arc<Self>,
-        _children: Vec<Arc<dyn ExecutionPlan>>,
-    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        Ok(self)
-    }
-
-    fn execute(
-        &self,
-        partition: usize,
-        context: Arc<TaskContext>,
-    ) -> DataFusionResult<SendableRecordBatchStream> {
-        if partition == 0 {
-            return memory_exec_with(self.schema.clone(), self.good.clone()).execute(0, context);
-        }
-        Ok(Box::pin(SingleErrorStream {
-            schema: self.schema.clone(),
-            message: format!("partition {partition} failed"),
-        }))
-    }
-}
-
-/// A stream that ends with one error and no batch.
-struct SingleErrorStream {
-    schema: SchemaRef,
-    message: String,
-}
-
-impl Stream for SingleErrorStream {
-    type Item = DataFusionResult<RecordBatch>;
-
-    fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        Poll::Ready(Some(Err(DataFusionError::Execution(self.message.clone()))))
-    }
-}
-
-impl RecordBatchStream for SingleErrorStream {
-    fn schema(&self) -> SchemaRef {
-        self.schema.clone()
-    }
 }

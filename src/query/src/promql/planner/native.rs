@@ -39,7 +39,7 @@ use datafusion_expr::Expr;
 use datatypes::series::SeriesOrdering;
 use datatypes::series::samples::{FieldSpec, SeriesSchema};
 use promql::extension_plan::{FusedSeries, FusedSeriesBinding};
-use promql::native::plan::{NativeExpr, NativeType, reads_across_series};
+use promql::native::plan::reads_across_series;
 use promql_parser::parser::value::ValueType;
 use promql_parser::parser::{
     EvalStmt, Expr as PromExpr, MatrixSelector, ParenExpr, VectorSelector,
@@ -119,9 +119,6 @@ impl PromPlanner {
             return Ok(None);
         }
 
-        if prom_expr.value_type() == ValueType::String {
-            return Ok(None);
-        }
         let mut selectors = Vec::new();
         collect_selectors(prom_expr, &mut selectors);
         let selector = match selectors.as_slice() {
@@ -138,13 +135,6 @@ impl PromPlanner {
                     Err(DataFusionError::NotImplemented(_)) => return Ok(None),
                     Err(error) => return Err(error).context(DataFusionPlanningSnafu),
                 };
-                // Scalar-only statements still need one describable field in the binding, even
-                // though the tree has no raw samples to read.
-                if tree_has_input(tree.root())
-                    || !matches!(&tree.root().output, NativeType::Scalar(_))
-                {
-                    return Ok(None);
-                }
                 let time_index = super::DEFAULT_TIME_INDEX_COLUMN.to_string();
                 let value = super::DEFAULT_FIELD_COLUMN.to_string();
                 let series_schema = Arc::new(SeriesSchema {
@@ -446,12 +436,13 @@ fn fused_output_schema(
     ))
 }
 
-/// The one selector `expr` folds, if it names exactly one.
+/// The range the range selector `expr` names, in milliseconds.
 ///
 /// The walk follows the grammar the native compiler accepts — calls, range selectors, selectors,
-/// parentheses, unary expressions and both sides of binary expressions. Two distinct selectors are
-/// not one input, and a tree built over the wrong one of them would evaluate a window the query did
-/// not write.
+/// parentheses, unary expressions and both sides of binary expressions — so a range is found
+/// wherever a shape the compiler folds hides it, and any other shape has none to report. The value
+/// is the bound the fused scan widens its own time window by, so that every grid point reads the
+/// samples the window folds.
 fn selector_range_millis(expr: &PromExpr) -> Option<i64> {
     match expr {
         PromExpr::MatrixSelector(matrix) => Some(matrix.range.as_millis() as i64),
@@ -509,18 +500,6 @@ fn metric_scan_and_table_id(
         return None;
     };
     Some((scan.clone(), filter.predicate.clone()))
-}
-
-fn tree_has_input(node: &promql::native::plan::NativeNode) -> bool {
-    match &node.expr {
-        NativeExpr::Input(_) => true,
-        NativeExpr::Scalar(_) => false,
-        NativeExpr::Instant { input, .. }
-        | NativeExpr::Window { input, .. }
-        | NativeExpr::Map { input, .. }
-        | NativeExpr::Aggregate { input, .. } => tree_has_input(input),
-        NativeExpr::Binary { left, right, .. } => tree_has_input(left) || tree_has_input(right),
-    }
 }
 
 fn collect_selectors<'a>(expr: &'a PromExpr, out: &mut Vec<&'a VectorSelector>) {

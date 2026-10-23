@@ -44,13 +44,13 @@
 //! (`topk`, `limitk`, `limit_ratio`) reads its one input the same way, because which samples it
 //! keeps at a point depends on every series present there.
 //!
-//! A constant scalar is a value node rather than a stream: it has no input and hands over no chunk,
-//! because what it produces is the one value it was bound to and not a series. A binary node with a
-//! scalar operand therefore reads one input — the vector side — and applies the operation to each
-//! chunk it is handed as it arrives: the scalar is read off the node's binding rather than pulled,
-//! and no chunk of the vector is retained, because one vector value pairs with one constant and
-//! nothing is decided by what comes after it. That broadcast is a different mode from the vector
-//! matching above and keeps neither operand: what it hands out is the chunk it transformed.
+//! A constant scalar has no input, but as a root it materializes one unlabelled evaluated chunk on
+//! its bound grid. A binary node with a scalar operand instead reads one input — the vector side —
+//! and applies the operation to each chunk it is handed as it arrives: the scalar is read from its
+//! binding rather than pulled, and no chunk of the vector is retained, because one vector value pairs
+//! with one constant and nothing is decided by what comes after it. That broadcast is a different
+//! mode from the vector matching above and keeps neither operand: what it hands out is the chunk it
+//! transformed.
 //!
 //! A node kind this runtime does not execute yet is rejected when the execution is built, naming
 //! the kind and its position. That is an aggregate, and a binary node whose two operands are
@@ -2097,7 +2097,7 @@ fn scalar_chunk(grid: Arc<EvalGrid>, value: f64) -> Result<EvaluatedChunk> {
     let time = GridRange::try_new(grid, 0, spec.len as usize).map_err(series_error)?;
     let values = Float64Array::from(vec![value; spec.len as usize]);
     let fields = SeriesFields::one(Samples::from_float(values));
-    let metric = MetricName::try_new(None, Vec::new()).map_err(series_error)?;
+    let metric = SeriesLabels::try_new(None, Vec::new()).map_err(series_error)?;
     let series =
         Series::try_new(&schema, metric, TimeAxis::Grid(time), fields).map_err(series_error)?;
     EvaluatedChunk::try_new(series, true)
@@ -2168,11 +2168,6 @@ struct NodeRuntime {
     /// The two modes are exclusive. A broadcast transforms each chunk of the vector side as it
     /// arrives and retains none of them, so what it holds is its own configuration and not data.
     broadcast: Option<BroadcastRuntime>,
-    /// Whether a scalar node has already handed over its one chunk.
-    ///
-    /// A scalar is the one node whose whole output is decided by its binding, so what it has left to
-    /// say is a flag rather than data: the value and the grid are read off the node itself.
-    scalar_emitted: bool,
     /// The layout the caller's chunks of an input node are checked against.
     ///
     /// A tree with a binary node reads two inputs, and each of them is bound to its own layout, so
@@ -2881,7 +2876,6 @@ impl NodeRuntime {
         self.aggregate = None;
         self.vector = None;
         self.broadcast = None;
-        self.scalar_emitted = false;
         self.source_schema = None;
         self.emitted = None;
         self.merge = None;
@@ -2993,7 +2987,6 @@ impl NativeExecutionState {
                 aggregate: None,
                 vector: None,
                 broadcast: None,
-                scalar_emitted: false,
                 source_schema: None,
                 emitted: None,
                 merge: None,
@@ -3137,8 +3130,8 @@ impl NativeExecutionState {
                     // label sets of its own, so it keeps no ledger of what it handed out.
                 }
                 NativeExpr::Scalar(_) => {
-                    // A scalar holds nothing: what its consumer reads is the constant the node was
-                    // bound to, which is on the tree rather than in this state.
+                    // A scalar's value and grid stay in its NodeSpec until the root materializes it;
+                    // broadcasts read the binding directly and never pull this node.
                 }
             }
             // The inputs this node reads, in the order the tree declares them: a unary node's one
@@ -3334,8 +3327,8 @@ impl NativeExecutionState {
             }
         }
 
-        // The runtime's output is an evaluated chunk. Raw samples have no grid, and a scalar or
-        // aggregate state is not a query value, so neither can be the tree's answer.
+        // The runtime's output is an evaluated chunk. Raw samples have no grid, while scalar roots
+        // materialize their bound values and aggregate states are not query values.
         match &tree.root().output {
             NativeType::Samples(schema) if schema.eval_grid.is_some() => {}
             NativeType::Scalar(_) => {}
@@ -3792,7 +3785,7 @@ impl NativeExecutor {
             // A scalar owes its one chunk until it hands it over, and nothing after that. No node
             // that reads samples takes a scalar as its input, so this answer is only ever read for
             // the root or by a broadcast, which reads the value off the binding and not from here.
-            NodeTag::Scalar => runtime.scalar_emitted,
+            NodeTag::Scalar => self.state.nodes[index].scalar.is_none(),
             // These report as they are handed chunks, so a child with nothing left is all it takes
             // for them to have nothing left either.
             NodeTag::Map | NodeTag::Window | NodeTag::Instant => self.state.nodes[index]
@@ -3930,15 +3923,24 @@ impl NativeExecutor {
             // has no input to pull from. A consumer that wants the value without a chunk (the
             // broadcast) reads it off the binding instead and never pulls this node.
             NodeTag::Scalar => {
-                if self.state.runtimes[index].scalar_emitted {
+                let Some((value, grid)) = self.state.nodes[index].scalar.take() else {
                     return Ok(None);
-                }
-                let (value, grid) = self.state.nodes[index]
-                    .scalar
-                    .as_ref()
-                    .ok_or_else(|| not_a_scalar(&self.state.paths[index]))?;
-                let chunk = scalar_chunk(Arc::clone(grid), *value)?;
-                self.state.runtimes[index].scalar_emitted = true;
+                };
+                let bytes = (grid.spec().len as usize)
+                    .saturating_mul(std::mem::size_of::<f64>())
+                    .saturating_add(
+                        std::mem::size_of::<EvaluatedChunk>() + std::mem::size_of::<Series>(),
+                    );
+                self.state.runtimes[index].buffer.grow(bytes)?;
+                let metrics = Arc::clone(&self.state.runtimes[index].buffer.metrics);
+                let chunk = {
+                    let _timer = metrics.timer();
+                    scalar_chunk(grid, value)?
+                };
+                metrics.record_output(1, valid_values(&chunk));
+                metrics.record_grid_points(chunk.series.time.len());
+                metrics.record_completed_series(1);
+                self.state.runtimes[index].buffer.shrink(bytes)?;
                 Ok(Some(NativeChunk::Evaluated(chunk)))
             }
             NodeTag::Map => {
@@ -4409,16 +4411,6 @@ fn truncated_input(path: &NodePath) -> DataFusionError {
 fn not_implemented(kind: &str, path: &NodePath) -> DataFusionError {
     DataFusionError::NotImplemented(format!(
         "the native runtime does not execute {kind} nodes yet: {kind} at {path}"
-    ))
-}
-
-/// The error for a node tagged as a scalar whose binding is not one.
-///
-/// The tag and the binding are decided in the same pass, so they cannot disagree in a tree this
-/// runtime built; the error exists so a tree it did not build cannot make it panic.
-fn not_a_scalar(path: &NodePath) -> DataFusionError {
-    DataFusionError::Execution(format!(
-        "the node at {path} is tagged as a scalar but does not bind one"
     ))
 }
 

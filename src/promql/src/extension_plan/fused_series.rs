@@ -70,7 +70,9 @@ use datafusion::physical_plan::{
 };
 use datatypes::series::SeriesOrdering;
 use datatypes::series::raw::RawSeriesChunk;
-use datatypes::series::samples::{DenseSamplesRef, SampleRef, Samples, Series, SeriesSchema};
+use datatypes::series::samples::{
+    DenseSamplesRef, FieldSpec, SampleRef, Samples, Series, SeriesSchema,
+};
 use datatypes::series::time::EvalGrid;
 use futures::Stream;
 use store_api::region_engine::{RawLabelSource, SendableRawSeriesStream};
@@ -392,12 +394,7 @@ impl Hash for FusedSeries {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.promql.hash(state);
         self.binding.hash(state);
-        // Whether there is a child is hashed beside it, so an absent input is not the hash of an
-        // empty plan by accident.
-        self.input.is_some().hash(state);
-        if let Some(input) = &self.input {
-            input.hash(state);
-        }
+        self.input.hash(state);
         self.output_schema.hash(state);
     }
 }
@@ -412,14 +409,9 @@ impl PartialOrd for FusedSeries {
             Some(Ordering::Equal) => {}
             ord => return ord,
         }
-        match (self.input.as_ref(), other.input.as_ref()) {
-            (None, None) => {}
-            (None, Some(_)) => return Some(Ordering::Less),
-            (Some(_), None) => return Some(Ordering::Greater),
-            (Some(mine), Some(theirs)) => match mine.partial_cmp(theirs) {
-                Some(Ordering::Equal) => {}
-                ord => return ord,
-            },
+        match self.input.partial_cmp(&other.input) {
+            Some(Ordering::Equal) => {}
+            ord => return ord,
         }
         match self.tree.to_string().partial_cmp(&other.tree.to_string()) {
             Some(Ordering::Equal) => {}
@@ -653,28 +645,15 @@ enum OutputColumn {
     Field(usize),
     /// Declared logical tag by index in the caller-supplied tag list.
     Tag(usize),
-    /// The one value of a scalar root, which every row of the output repeats.
-    Scalar,
 }
 
 /// Classifies every output column, rejecting anything the conversion cannot produce.
 fn classify_output(
     output_schema: &SchemaRef,
-    series_schema: Option<&SeriesSchema>,
+    series_schema: &SeriesSchema,
     tags: &[String],
     time_column: &str,
-    scalar_root: bool,
 ) -> DataFusionResult<Vec<OutputColumn>> {
-    if scalar_root {
-        return classify_scalar_output(output_schema, tags, time_column);
-    }
-    let series_schema = series_schema.ok_or_else(|| {
-        DataFusionError::Plan(
-            "FusedSeries runs a tree that produces samples and reads no raw series, which has \
-             nothing to convert"
-                .to_string(),
-        )
-    })?;
     for (index, tag) in tags.iter().enumerate() {
         if tags[..index].contains(tag) {
             return Err(DataFusionError::Plan(format!(
@@ -803,173 +782,6 @@ fn classify_output(
     Ok(classification)
 }
 
-/// Classifies the output of a scalar root: one time column and one value column, nothing else.
-///
-/// A scalar carries no labels and no fields of its own, so a tag column would have nothing to fill
-/// it and a series-field column would name a field the tree does not have. What the node reports is
-/// therefore exactly the grid position and the value at it, which is the shape the existing scalar
-/// path produces and the shape the Prometheus JSON writer reads as a scalar result.
-fn classify_scalar_output(
-    output_schema: &SchemaRef,
-    tags: &[String],
-    time_column: &str,
-) -> DataFusionResult<Vec<OutputColumn>> {
-    if !tags.is_empty() {
-        return Err(DataFusionError::Plan(format!(
-            "a scalar FusedSeriesExec output has no tags, but {} were declared",
-            tags.len()
-        )));
-    }
-    let mut time_seen = false;
-    let mut value_seen = false;
-    let mut classification = Vec::with_capacity(output_schema.fields().len());
-    for field in output_schema.fields() {
-        let name = field.name();
-        if name == time_column {
-            if std::mem::replace(&mut time_seen, true) {
-                return Err(DataFusionError::Plan(format!(
-                    "duplicate time column {name:?} in FusedSeriesExec output schema"
-                )));
-            }
-            match field.data_type() {
-                DataType::Timestamp(TimeUnit::Millisecond, None) => {}
-                other => {
-                    return Err(DataFusionError::Plan(format!(
-                        "time column {name:?} of FusedSeriesExec must be Timestamp(Millisecond, \
-                         None), got {other:?}"
-                    )));
-                }
-            }
-            if field.is_nullable() {
-                return Err(DataFusionError::Plan(format!(
-                    "time column {name:?} of FusedSeriesExec must not be nullable"
-                )));
-            }
-            classification.push(OutputColumn::Time);
-            continue;
-        }
-        if std::mem::replace(&mut value_seen, true) {
-            return Err(DataFusionError::Plan(format!(
-                "scalar FusedSeriesExec output declares a second value column {name:?}: a scalar \
-                 has one value per grid point"
-            )));
-        }
-        // A scalar's value is a float at every position it reports; the column is nullable because
-        // a chunk may carry no row at all when every position was filtered away.
-        if field.data_type() != &DataType::Float64 {
-            return Err(DataFusionError::Plan(format!(
-                "value column {name:?} of a scalar FusedSeriesExec must be Float64, got {:?}",
-                field.data_type()
-            )));
-        }
-        classification.push(OutputColumn::Scalar);
-    }
-    if !time_seen {
-        return Err(DataFusionError::Plan(format!(
-            "missing time column {time_column:?} in FusedSeriesExec output schema"
-        )));
-    }
-    if !value_seen {
-        return Err(DataFusionError::Plan(
-            "missing value column in a scalar FusedSeriesExec output schema".to_string(),
-        ));
-    }
-    Ok(classification)
-}
-
-/// Opens the raw series streams one execution reads, in the order it drains them.
-///
-/// The list is every child partition for a fan-in and only this execution's own partition
-/// otherwise. A partition is opened by asking the child for it and decoding what it hands over, so
-/// the child keeps the partitioning it was planned with: a fan-in reads more of it, it does not
-/// replace it.
-///
-/// The streams are drained in this order and a series never spans partitions, so the tree sees each
-/// series' chunks contiguously even though they came from different streams.
-fn open_raw_series(
-    child: &Arc<dyn ExecutionPlan>,
-    partitions: impl IntoIterator<Item = usize>,
-    series_schema: Option<Arc<SeriesSchema>>,
-    context: &Arc<TaskContext>,
-) -> DataFusionResult<VecDeque<SendableRawSeriesStream>> {
-    let mut input = VecDeque::new();
-    for partition in partitions {
-        let stream = child.execute(partition, Arc::clone(context))?;
-        // Batches become raw series chunks through the shared frame decoder, which is the inverse of
-        // what the producer packed: one chunk per frame row, each series closed exactly once by the
-        // row carrying `is_last`.
-        let stream = unpack_raw_series(stream, series_schema.clone())?;
-        // A source bound in key mode carries its identity encoded and no decoded labels, and a
-        // chunk handed to the tree has to name the series it holds.
-        let stream =
-            materialize_raw_labels(stream).map_err(|e| DataFusionError::External(Box::new(e)))?;
-        input.push_back(stream);
-    }
-    Ok(input)
-}
-
-/// Builds the stream that runs `tree` over `input`, already attached to the task's pool.
-///
-/// Both halves of this node - the per-partition runs and the fan-in - reach the driver through
-/// here, so what the stream does with an input queue, an ended input and a failing partition is one
-/// piece of code and one set of tests rather than a copy per mode.
-///
-/// A tree with no child reads nothing, so its input has ended before the first poll. A fan-in is not
-/// that case: its input ends only when every child partition's stream did, which the stream observes
-/// itself.
-#[allow(clippy::too_many_arguments)]
-fn series_stream(
-    tree: &Arc<NativeTree>,
-    partition: usize,
-    metric: &ExecutionPlanMetricsSet,
-    input: VecDeque<SendableRawSeriesStream>,
-    input_path: Option<NodePath>,
-    classification: Arc<[OutputColumn]>,
-    tags: Arc<[String]>,
-    output_schema: SchemaRef,
-    labels: SharedLabelSets,
-    context: &Arc<TaskContext>,
-) -> DataFusionResult<FusedSeriesStream> {
-    // What the label sets hold is charged to the plan's reservation, attached by the caller's
-    // execution, so nothing is reserved per stream: the entries outlive every stream and are
-    // released with the plan.
-    {
-        let mut labels = labels.lock().unwrap_or_else(|e| e.into_inner());
-        labels.attach(&context.runtime_env().memory_pool);
-    }
-    let mut executor = NativeExecutor::new(NativeExecutionState::try_new(
-        tree,
-        Arc::clone(&context.runtime_env().memory_pool),
-        metric,
-        partition,
-    )?);
-    if input.is_empty() {
-        executor.end_of_input()?;
-    }
-    Ok(FusedSeriesStream {
-        input,
-        executor: Some(executor),
-        input_path,
-        classification,
-        tags,
-        output_schema,
-        labels,
-        ready: VecDeque::new(),
-        done: false,
-    })
-}
-
-/// Whether a tree's answer depends on every child partition rather than on one of them.
-///
-/// Only a scalar root does: a scalar is one value per evaluation point derived from the whole
-/// vector, so an execution that read one partition would answer from part of it. No tree reads raw
-/// samples and returns a scalar yet - [`NativeExpr::Scalar`] binds a constant and has no input - so
-/// this answers `true` only once the scalar adapter lands; the driver below already implements the
-/// contract it names, and its tests drive it with an ordinary samples tree.
-fn needs_every_partition(tree: &NativeTree) -> bool {
-    matches!(tree.root().output, NativeType::Scalar(_))
-}
-
 /// The physical node that runs a compiled native tree over its input's raw series.
 pub struct FusedSeriesExec {
     /// The PromQL text the tree was compiled from, which is what the plan line shows.
@@ -977,7 +789,7 @@ pub struct FusedSeriesExec {
     /// The tree this node runs, shared by every partition's execution.
     tree: Arc<NativeTree>,
     /// The raw series schema the tree's input was compiled against, which every frame is decoded
-    /// against. `None` when the tree reads no raw samples.
+    /// against.
     series_schema: Option<Arc<SeriesSchema>>,
     /// How the input frames name their series: labels encoded in the key, or carried along.
     label_source: Option<RawLabelSource>,
@@ -992,7 +804,7 @@ pub struct FusedSeriesExec {
     time_column: String,
     /// The tag column names, indexed by [`OutputColumn::Tag`].
     tags: Arc<[String]>,
-    /// The plan producing the raw series frames, or `None` when the tree reads none.
+    /// The plan producing the raw series frames.
     input: Option<Arc<dyn ExecutionPlan>>,
     /// The columns this node produces.
     output_schema: SchemaRef,
@@ -1003,17 +815,6 @@ pub struct FusedSeriesExec {
     labels: SharedLabelSets,
     /// Per-node metrics, registered by each execution of the tree.
     metric: ExecutionPlanMetricsSet,
-    /// Whether this node answers from every child partition instead of from one of them.
-    ///
-    /// True exactly when the tree's root is a scalar that reads raw samples: a scalar's value at an
-    /// evaluation point is a property of the whole vector, so an execution that saw one partition
-    /// could only report a value the query did not ask for. Every other shape answers per partition,
-    /// which is what keeps the scan's parallelism reaching the output.
-    fan_in: bool,
-    /// How many partitions the child hands over, which is what a fan-in execution reads.
-    ///
-    /// One for every node that answers per partition, because then there is nothing to fan in.
-    child_partitions: usize,
     /// This node's partitioning, emission and boundedness.
     properties: Arc<PlanProperties>,
 }
@@ -1047,127 +848,138 @@ impl FusedSeriesExec {
             &ExecutionPlanMetricsSet::new(),
             0,
         )?;
-        // The root decides what the output can hold, and the child decides what the input can feed:
-        // they are separate questions, so a tree that reads raw samples and returns a scalar is one
-        // node with a child and a scalar output schema.
-        let scalar_root = matches!(tree.root().output, NativeType::Scalar(_));
-        let classification = classify_output(
-            &output_schema,
-            tree_input.as_ref().map(|input| input.schema.as_ref()),
-            &tags,
-            &time_column,
-            scalar_root,
-        )?;
-        let (input, label_source, ordering, input_path, child_partitions, fan_in, properties) =
-            match input {
-                FusedExecInput::None => {
-                    if tree_input.is_some() {
-                        return Err(DataFusionError::Plan(
-                            "FusedSeriesExec was given no child, and its tree reads raw samples"
-                                .to_string(),
-                        ));
-                    }
-                    // Nothing below the node, so nothing can split the answer: one partition, produced
-                    // as the root settles it.
-                    let properties = Arc::new(PlanProperties::new(
-                        EquivalenceProperties::new(output_schema.clone()),
-                        Partitioning::UnknownPartitioning(1),
-                        EmissionType::Incremental,
-                        Boundedness::Bounded,
-                    ));
-                    (None, None, None, None, 1, false, properties)
-                }
-                FusedExecInput::RawSeries {
-                    input,
-                    label_source,
-                    ordering,
-                } => {
-                    let Some(tree_input) = &tree_input else {
-                        return Err(DataFusionError::Plan(
-                            "FusedSeriesExec was given a child, and its tree reads no raw samples"
-                                .to_string(),
-                        ));
-                    };
-                    // Read here rather than below, because whether the split below can happen decides
-                    // whether the tree shape is one this node may run at all.
-                    let input_properties = input.properties();
-                    let partition_count = input_properties.partitioning.partition_count();
-                    if partition_count == 0 {
-                        return Err(DataFusionError::Plan(
-                            "FusedSeriesExec input has no partitions".into(),
-                        ));
-                    }
-                    // A scalar root reads the whole vector: its value at an evaluation point is a
-                    // property of every series, so this execution has to see every partition's
-                    // contribution and can only answer once all of them ended. That fan-in is what
-                    // makes the split below impossible to begin with - one execution merges the
-                    // fragments itself - so the guard is asked only when the answer is per partition.
-                    //
-                    // No tree reaches this today: `NativeExpr::Scalar` binds a constant and has no
-                    // input, so a tree that reads raw samples and returns a scalar cannot be built
-                    // until the `scalar(v)` node (`NativeExpr::Scalar` carrying an input) lands. The
-                    // fan-in below is written now because it is this node's contract for that shape,
-                    // and its test is the two-partition case of the adapter integration.
-                    let fan_in = needs_every_partition(&tree);
-                    if !fan_in {
-                        reject_a_split_logical_series(&tree, partition_count)?;
-                    }
-                    // The frame states its own label layout and series ordering; this plan's binding is
-                    // an expectation checked against that declaration, not an input to decoding.
-                    ensure_frame_matches_label_source(input.schema().as_ref(), &label_source)?;
-                    // The frame is checked against what the tree's input reads, so a frame this node
-                    // cannot decode is reported when the plan is built. The shared decoder is the
-                    // authority on that layout, so it is asked rather than copied: handing it an empty
-                    // stream of this schema makes it validate the declared frame with no batch to
-                    // decode, which is the check `unpack_raw_series` makes before its first poll too.
-                    unpack_raw_series(
-                        Box::pin(RecordBatchStreamAdapter::new(
-                            input.schema(),
-                            futures::stream::empty(),
-                        )),
-                        Some(Arc::clone(&tree_input.schema)),
-                    )?;
-                    // One evaluator per input partition, and the input's own partitioning kept as it is.
-                    //
-                    // A window holds the state of the series it is reading and closes it on the chunk carrying
-                    // `is_last`, so it can answer a series only if the whole series arrives in the partition it
-                    // reads. The input guarantees that: a raw series frame is produced by `SeriesScan`, whose
-                    // contract is that the same primary key always reaches the same partition, and the frame
-                    // decoder holds each series' chunks contiguous within that partition.
-                    //
-                    // What is *not* asked of the optimizer is a distribution. A `KeyPartitioned` or
-                    // `HashPartitioned` requirement is classed as a hash requirement, and a hash requirement
-                    // makes a hash exchange necessary whenever the child has more than one partition - even if
-                    // the child already satisfies it, and even when the partition counts match. A hash exchange
-                    // does not preserve order, so it would interleave the chunks of one series and the decoder
-                    // would close a series it has not finished. `UnspecifiedDistribution` leaves the child's
-                    // layout alone, and `benefits_from_input_partitioning` is false so no round-robin is added
-                    // to raise parallelism either. Between them no exchange can appear between the scan and this
-                    // node, and the scan's guarantee arrives intact.
-                    // One evaluator per partition, answering each as it settles - except for a scalar
-                    // root, which runs one evaluator over every partition. The child keeps its own
-                    // partition count either way: the scan's parallelism is what the fan-in reads, not
-                    // something it replaces.
-                    // A fan-in reads every partition in one execution; anything else keeps one
-                    // execution per partition, so the scan's parallelism reaches the output.
-                    let partitions = if fan_in { 1 } else { partition_count };
-                    let properties = Arc::new(PlanProperties::new(
-                        EquivalenceProperties::new(output_schema.clone()),
-                        Partitioning::UnknownPartitioning(partitions),
-                        input_properties.emission_type,
-                        input_properties.boundedness,
-                    ));
-                    (
-                        Some(input),
-                        Some(label_source),
-                        Some(ordering),
-                        Some(tree_input.path.clone()),
-                        partition_count,
-                        fan_in,
-                        properties,
-                    )
-                }
+        // A tree that reads raw samples is classified against the schema its input was compiled
+        // against. A tree that reads none reports one value column per grid point and no tags, and
+        // that column stands in for the single field of a one-field series schema, so the same
+        // classification decides whether the output can be converted.
+        let classification = if let Some(tree_input) = &tree_input {
+            classify_output(&output_schema, &tree_input.schema, &tags, &time_column)?
+        } else {
+            if !matches!(tree.root().output, NativeType::Scalar(_)) {
+                return Err(DataFusionError::Plan(
+                    "FusedSeries runs a tree that produces samples and reads no raw series, which \
+                     has nothing to convert"
+                        .to_string(),
+                ));
+            }
+            if !tags.is_empty() {
+                return Err(DataFusionError::Plan(format!(
+                    "a scalar FusedSeriesExec output has no tags, but {} were declared",
+                    tags.len()
+                )));
+            }
+            // A scalar has one value per grid point, so exactly one column is not the time column.
+            let mut values = output_schema
+                .fields()
+                .iter()
+                .filter(|field| field.name().as_str() != time_column.as_str());
+            let Some(value) = values.next() else {
+                return Err(DataFusionError::Plan(
+                    "missing value column in a scalar FusedSeriesExec output schema".to_string(),
+                ));
             };
+            if let Some(second) = values.next() {
+                return Err(DataFusionError::Plan(format!(
+                    "scalar FusedSeriesExec output declares a second value column {:?}: a scalar \
+                     has one value per grid point",
+                    second.name()
+                )));
+            }
+            let scalar_schema = SeriesSchema {
+                fields: vec![FieldSpec {
+                    name: Arc::from(value.name().as_str()),
+                }]
+                .into(),
+                eval_grid: None,
+            };
+            classify_output(&output_schema, &scalar_schema, &tags, &time_column)?
+        };
+        let (input, label_source, ordering, input_path, properties) = match input {
+            FusedExecInput::None => {
+                if tree_input.is_some() {
+                    return Err(DataFusionError::Plan(
+                        "FusedSeriesExec was given no child, and its tree reads raw samples"
+                            .to_string(),
+                    ));
+                }
+                // Nothing below the node, so nothing can split the answer: one partition, produced
+                // as the root settles it.
+                let properties = Arc::new(PlanProperties::new(
+                    EquivalenceProperties::new(output_schema.clone()),
+                    Partitioning::UnknownPartitioning(1),
+                    EmissionType::Incremental,
+                    Boundedness::Bounded,
+                ));
+                (None, None, None, None, properties)
+            }
+            FusedExecInput::RawSeries {
+                input,
+                label_source,
+                ordering,
+            } => {
+                let Some(tree_input) = &tree_input else {
+                    return Err(DataFusionError::Plan(
+                        "FusedSeriesExec was given a child, and its tree reads no raw samples"
+                            .to_string(),
+                    ));
+                };
+                // Read here rather than below, because whether the split below can happen decides
+                // whether the tree shape is one this node may run at all.
+                let input_properties = input.properties();
+                let partition_count = input_properties.partitioning.partition_count();
+                if partition_count == 0 {
+                    return Err(DataFusionError::Plan(
+                        "FusedSeriesExec input has no partitions".into(),
+                    ));
+                }
+                reject_a_split_logical_series(&tree, partition_count)?;
+                // The frame states its own label layout and series ordering; this plan's binding is
+                // an expectation checked against that declaration, not an input to decoding.
+                ensure_frame_matches_label_source(input.schema().as_ref(), &label_source)?;
+                // The frame is checked against what the tree's input reads, so a frame this node
+                // cannot decode is reported when the plan is built. The shared decoder is the
+                // authority on that layout, so it is asked rather than copied: handing it an empty
+                // stream of this schema makes it validate the declared frame with no batch to
+                // decode, which is the check `unpack_raw_series` makes before its first poll too.
+                unpack_raw_series(
+                    Box::pin(RecordBatchStreamAdapter::new(
+                        input.schema(),
+                        futures::stream::empty(),
+                    )),
+                    Some(Arc::clone(&tree_input.schema)),
+                )?;
+                // One evaluator per input partition, and the input's own partitioning kept as it is.
+                //
+                // A window holds the state of the series it is reading and closes it on the chunk carrying
+                // `is_last`, so it can answer a series only if the whole series arrives in the partition it
+                // reads. The input guarantees that: a raw series frame is produced by `SeriesScan`, whose
+                // contract is that the same primary key always reaches the same partition, and the frame
+                // decoder holds each series' chunks contiguous within that partition.
+                //
+                // What is *not* asked of the optimizer is a distribution. A `KeyPartitioned` or
+                // `HashPartitioned` requirement is classed as a hash requirement, and a hash requirement
+                // makes a hash exchange necessary whenever the child has more than one partition - even if
+                // the child already satisfies it, and even when the partition counts match. A hash exchange
+                // does not preserve order, so it would interleave the chunks of one series and the decoder
+                // would close a series it has not finished. `UnspecifiedDistribution` leaves the child's
+                // layout alone, and `benefits_from_input_partitioning` is false so no round-robin is added
+                // to raise parallelism either. Between them no exchange can appear between the scan and this
+                // node, and the scan's guarantee arrives intact.
+                let properties = Arc::new(PlanProperties::new(
+                    EquivalenceProperties::new(output_schema.clone()),
+                    Partitioning::UnknownPartitioning(partition_count),
+                    input_properties.emission_type,
+                    input_properties.boundedness,
+                ));
+                (
+                    Some(input),
+                    Some(label_source),
+                    Some(ordering),
+                    Some(tree_input.path.clone()),
+                    properties,
+                )
+            }
+        };
         // Shared by every partition's stream: a label set colliding is a property of the whole
         // output vector, not of one partition. Building it needs no pool; the owner's reservation is
         // attached in `execute`, which is the first point that has one.
@@ -1186,8 +998,6 @@ impl FusedSeriesExec {
             output_schema,
             labels,
             metric: ExecutionPlanMetricsSet::new(),
-            fan_in,
-            child_partitions,
             properties,
         })
     }
@@ -1229,13 +1039,6 @@ impl ExecutionPlan for FusedSeriesExec {
     /// the scan it reads from guarantees a series stays in one partition, so the requirement says
     /// only that the layout is left alone.
     fn input_distribution_requirements(&self) -> InputDistributionRequirements {
-        // A fan-in reads the child's partitions itself, so what it needs from them is only that
-        // each series stays in the partition it was scanned in - the guarantee the raw series frame
-        // already carries. Asking for a distribution would insert an exchange, and an exchange that
-        // reorders would interleave one series' chunks, which the decoder refuses.
-        //
-        // One entry per child, which DataFusion asserts: a node with no child requires nothing of
-        // an input it does not have.
         InputDistributionRequirements::new(vec![
             Distribution::UnspecifiedDistribution;
             self.children().len()
@@ -1246,8 +1049,6 @@ impl ExecutionPlan for FusedSeriesExec {
     /// answered by a second tree, which this node already runs, and raising the count is what an
     /// optimizer does by adding a round-robin exchange that reorders nothing it can rely on.
     fn benefits_from_input_partitioning(&self) -> Vec<bool> {
-        // One answer per child, which DataFusion asserts: a node with no child has no input to
-        // partition, and answering for one would trip that assertion before the plan runs.
         vec![false; self.children().len()]
     }
 
@@ -1319,10 +1120,7 @@ impl ExecutionPlan for FusedSeriesExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> DataFusionResult<SendableRecordBatchStream> {
-        // A node that answers one partition - because it has no child, or because it fans every
-        // child partition into one answer - has no other index to offer. Refusing it here keeps the
-        // caller's mistake from looking like an empty result, which is what an execution built and
-        // never fed would report.
+        // A node without a child has one partition; reject an invalid partition index.
         if self.properties.partitioning.partition_count() == 1 && partition != 0 {
             return Err(DataFusionError::Execution(format!(
                 "FusedSeriesExec has one partition, and partition {partition} was asked for"
@@ -1336,46 +1134,42 @@ impl ExecutionPlan for FusedSeriesExec {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .attach(&context.runtime_env().memory_pool);
-        // The input of a tree that reads no raw samples is empty from the start rather than missing:
-        // the executor is told its input ended before the first poll, which is the same state a
-        // stream reaches after its child ends, so there is one path through the stream and no second
-        // way to run a tree.
         let (input, input_path) = match (&self.input, &self.input_path) {
             (Some(child), Some(path)) => {
-                // Which child partitions this execution reads: its own one, or - for a scalar root,
-                // whose value at a point depends on the whole vector - all of them. The partitions
-                // are read one after another, so a series' chunks stay contiguous even across this
-                // hand-over, and the child keeps every partition it was planned with.
-                let partitions: Vec<usize> = if self.fan_in {
-                    (0..self.child_partitions).collect()
-                } else {
-                    vec![partition]
-                };
-                let input =
-                    open_raw_series(child, partitions, self.series_schema.clone(), &context)?;
-                (input, Some(path.clone()))
+                let stream = child.execute(partition, Arc::clone(&context))?;
+                let stream = unpack_raw_series(stream, self.series_schema.clone())?;
+                let stream = materialize_raw_labels(stream)
+                    .map_err(|e| DataFusionError::External(Box::new(e)))?;
+                (Some(stream), Some(path.clone()))
             }
-            (None, None) => (VecDeque::new(), None),
+            (None, None) => (None, None),
             _ => {
                 return Err(DataFusionError::Plan(
-                    "FusedSeriesExec has a child but no input position, or the reverse, so its \
-                     chunks have nowhere to enter"
-                        .to_string(),
+                    "FusedSeriesExec has a child but no input position, or the reverse".to_string(),
                 ));
             }
         };
-        Ok(Box::pin(series_stream(
+        let mut executor = NativeExecutor::new(NativeExecutionState::try_new(
             &self.tree,
-            partition,
+            Arc::clone(&context.runtime_env().memory_pool),
             &self.metric,
+            partition,
+        )?);
+        if input.is_none() {
+            executor.end_of_input()?;
+        }
+        let stream = FusedSeriesStream {
             input,
+            executor: Some(executor),
             input_path,
-            Arc::clone(&self.classification),
-            Arc::clone(&self.tags),
-            self.output_schema.clone(),
-            Arc::clone(&self.labels),
-            &context,
-        )?))
+            classification: Arc::clone(&self.classification),
+            tags: Arc::clone(&self.tags),
+            output_schema: self.output_schema.clone(),
+            labels: Arc::clone(&self.labels),
+            ready: VecDeque::new(),
+            done: false,
+        };
+        Ok(Box::pin(stream))
     }
 
     fn metrics(&self) -> Option<MetricsSet> {
@@ -1424,22 +1218,6 @@ fn series_to_record_batch(
                 if samples.len() != rows {
                     return Err(DataFusionError::Execution(format!(
                         "evaluated series field {index} has {} rows, time axis has {rows}",
-                        samples.len()
-                    )));
-                }
-                columns.push(field_column(samples)?);
-            }
-            OutputColumn::Scalar => {
-                // The scalar root's one value, repeated on every row the chunk carries: a scalar is
-                // one value per grid point, so the field has exactly one column.
-                let samples = series.fields.get(0).ok_or_else(|| {
-                    DataFusionError::Execution(
-                        "a scalar root produced a series with no value".to_string(),
-                    )
-                })?;
-                if samples.len() != rows {
-                    return Err(DataFusionError::Execution(format!(
-                        "a scalar root produced {} values for a time axis of {rows}",
                         samples.len()
                     )));
                 }
@@ -1748,16 +1526,8 @@ fn colliding_field(stored: &[Vec<Run>], runs: &[Vec<Run>]) -> Option<usize> {
 
 /// The batches one execution of [`FusedSeriesExec`] yields.
 pub struct FusedSeriesStream {
-    /// The input frames, read as raw series chunks, drained in order and empty once the stream
-    /// ended or failed.
-    ///
-    /// Most trees read one child partition, so this holds one stream. A tree whose root is a scalar
-    /// reads every child partition in this one execution - the value at an evaluation point is a
-    /// property of the whole vector, not of the partition it happens to arrive on - so the list is
-    /// how that fan-in is expressed. Each decoder holds its current batch, the chunks it decoded
-    /// from it and its own source, so a terminated stream that kept them alive would hold upstream
-    /// resources until the consumer drops the stream.
-    input: VecDeque<SendableRawSeriesStream>,
+    /// The input frames, read as raw series chunks, or `None` once the stream ended in an error.
+    input: Option<SendableRawSeriesStream>,
     /// The execution of this node's tree, or `None` once it has been closed.
     executor: Option<NativeExecutor>,
     /// The position of the tree's input node, which is where every chunk read enters, or `None`
@@ -1846,7 +1616,7 @@ impl FusedSeriesStream {
     fn fail(&mut self) {
         self.done = true;
         self.executor = None;
-        self.input.clear();
+        self.input = None;
         // The label-set map and its charge are the plan's, so a stream stopping early gives back
         // nothing: the entries another partition is still checking against have to stay charged, and
         // are released when the plan itself is dropped.
@@ -1898,8 +1668,7 @@ impl Stream for FusedSeriesStream {
             if this.done {
                 return Poll::Ready(None);
             }
-            // An error is the only thing that clears the input, and it ends the stream with it.
-            let Some(input) = this.input.front_mut() else {
+            let Some(input) = this.input.as_mut() else {
                 // The input ended, so what the tree answers now comes from what it held. One chunk
                 // per iteration keeps it a stream, and `None` is both "nothing more" and the point
                 // where the execution releases its reservations.
@@ -1925,20 +1694,11 @@ impl Stream for FusedSeriesStream {
             match polled {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(None) => {
-                    // One child partition ended. A series never spans two partitions - the scan
-                    // guarantees that - so the next partition's series can follow without closing
-                    // anything here.
-                    this.input.pop_front();
-                    if this.input.is_empty() {
-                        // Every partition ended, so the whole vector this execution reads is in.
-                        // Only now does the tree settle what it was holding: a scalar's value at an
-                        // evaluation point has to see every partition's contribution, so closing
-                        // the input is what says nothing more can arrive. The answers are pulled
-                        // below in this same poll rather than collected first.
-                        if let Err(error) = this.close_input() {
-                            this.fail();
-                            return Poll::Ready(Some(Err(error)));
-                        }
+                    // The input ended, so every series it opened has to be closed.
+                    this.input = None;
+                    if let Err(error) = this.close_input() {
+                        this.fail();
+                        return Poll::Ready(Some(Err(error)));
                     }
                 }
                 Poll::Ready(Some(Err(error))) => {

@@ -46,6 +46,9 @@ use common_frontend::slow_query_event::{
 };
 use common_memory_manager::OnExhaustedPolicy;
 use common_options::plugin_options::StandaloneFlag;
+use datafusion::arrow::array::{
+    Array as _, Float64Array, StringArray, StringViewArray, TimestampMillisecondArray,
+};
 use datafusion::physical_plan::displayable;
 use flate2::Compression;
 use flate2::write::GzEncoder;
@@ -1453,13 +1456,7 @@ pub async fn test_prometheus_promql_api(store_type: StorageType) {
     guard.remove_all().await;
 }
 
-/// The native PromQL route answers the same public responses as the existing one.
-///
-/// What is checked is the HTTP body, not the plan: the route is enabled server-side here and asked
-/// for per query, and a scalar statement and a scalar broadcast each have to reach the client with
-/// the values and shape the existing planner produces. The scalar case is the one the two routes
-/// could not historically share - the native route reads no samples at all - so `1 + 1` is the case
-/// worth pinning first.
+/// Checks public results and executed plans for the native PromQL route.
 pub async fn test_prometheus_native_promql_route(store_type: StorageType) {
     let (app, mut guard) =
         setup_test_prom_app_with_frontend_and_native_promql(store_type, "promql_native_route")
@@ -1467,8 +1464,6 @@ pub async fn test_prometheus_native_promql_route(store_type: StorageType) {
     let client = TestClient::new(app).await;
     let hints = ("x-greptime-hints", "query.experimental_native_promql=true");
 
-    // A plain table, because the route declines a metric-engine table whose partition columns are
-    // not all selector tags: the scan below the node has to be the selector's own.
     let sql = "CREATE TABLE native_demo (ts TIMESTAMP TIME INDEX, val DOUBLE, host STRING, PRIMARY KEY (host))";
     let res = client
         .get(&format!("/v1/sql?db=public&sql={}", encode(sql)))
@@ -1482,9 +1477,42 @@ pub async fn test_prometheus_native_promql_route(store_type: StorageType) {
         .await;
     assert_eq!(res.status(), StatusCode::OK, "{sql}");
 
-    // A scalar statement reads no raw samples at all.
+    for native in [false, true] {
+        for (query, expected) in [
+            ("1 + 2", json!({"resultType":"scalar","result":[1.0,"3.0"]})),
+            (
+                "native_demo * 100",
+                json!({"resultType":"vector","result":[{"metric":{"host":"h1"},"value":[1.0,"200.0"]}]}),
+            ),
+            (
+                "-native_demo",
+                json!({"resultType":"vector","result":[{"metric":{"host":"h1"},"value":[1.0,"-2.0"]}]}),
+            ),
+        ] {
+            let mut request = client.get(&format!(
+                "/v1/prometheus/api/v1/query?query={}&time=1",
+                encode(query)
+            ));
+            if native {
+                request = request.header(hints.0, hints.1);
+            }
+            let res = request.send().await;
+            assert_eq!(res.status(), StatusCode::OK, "{query}, native={native}");
+            let body = serde_json::from_str::<PrometheusJsonResponse>(&res.text().await).unwrap();
+            assert_eq!(body.status, "success", "{query}, native={native}");
+            assert_eq!(
+                serde_json::to_value(body.data).unwrap(),
+                expected,
+                "{query}, native={native}"
+            );
+        }
+    }
+
+    let query = encode("native_demo * 100");
     let res = client
-        .get("/v1/prometheus/api/v1/query?query=1%2B1&time=1")
+        .get(&format!(
+            "/v1/prometheus/api/v1/query_range?query={query}&start=0&end=2&step=1s"
+        ))
         .header(hints.0, hints.1)
         .send()
         .await;
@@ -1492,91 +1520,170 @@ pub async fn test_prometheus_native_promql_route(store_type: StorageType) {
     let body = serde_json::from_str::<PrometheusJsonResponse>(&res.text().await).unwrap();
     assert_eq!(body.status, "success");
     assert_eq!(
-        body.data,
-        serde_json::from_value::<PrometheusResponse>(
-            json!({"resultType":"scalar","result":[1.0,"2.0"]})
-        )
-        .unwrap()
-    );
-
-    // A scalar broadcast over a selector, asked with the route on and off: both answer from the
-    // table, and they have to agree, because the fallback is what the client would otherwise get.
-    let query = encode("native_demo * 100");
-    let native = client
-        .get(&format!(
-            "/v1/prometheus/api/v1/query?query={query}&time=1000"
-        ))
-        .header(hints.0, hints.1)
-        .send()
-        .await;
-    let native_status = native.status();
-    let native_text = native.text().await;
-    assert_eq!(
-        native_status,
-        StatusCode::OK,
-        "`native_demo * 100` with the route on: {native_text}"
-    );
-    let native = serde_json::from_str::<PrometheusJsonResponse>(&native_text).unwrap();
-    assert_eq!(native.status, "success", "{native_text}");
-
-    let fallback = client
-        .get(&format!(
-            "/v1/prometheus/api/v1/query?query={query}&time=1000"
-        ))
-        .send()
-        .await;
-    let fallback_status = fallback.status();
-    let fallback_text = fallback.text().await;
-    assert_eq!(
-        fallback_status,
-        StatusCode::OK,
-        "`native_demo * 100` with the route off: {fallback_text}"
-    );
-    let fallback = serde_json::from_str::<PrometheusJsonResponse>(&fallback_text).unwrap();
-    assert_eq!(fallback.status, "success", "{fallback_text}");
-    assert_eq!(
-        native.data, fallback.data,
-        "the native route and the existing plan reported different results for `native_demo * 100`"
+        serde_json::to_value(body.data).unwrap(),
+        json!({"resultType":"matrix","result":[{"metric":{"host":"h1"},"values":[[0.0,"100.0"],[1.0,"200.0"],[2.0,"200.0"]]}]})
     );
 
     guard.remove_all().await;
 }
 
-/// The native route is the plan that ran, not merely a plan that agrees with the old one.
-///
-/// A behaviour-only test cannot tell "the route ran and answered" from "the route declined and the
-/// existing planner answered", and the second is exactly what a broken wire-up looks like. So this
-/// asks the frontend directly and reads the plan it reports back: the query has to be planned by
-/// `FusedSeriesExec`, with a child for the broadcast and without one for the scalar.
+/// Verifies native PromQL execution and its terminal-stage scan metrics.
 pub async fn test_native_promql_route_plans_the_query(store_type: StorageType) {
     let instance =
         tests_integration::standalone::GreptimeDbStandaloneBuilder::new("promql_native_route_plan")
             .with_default_store_type(store_type)
             .with_query_options(QueryOptions {
                 experimental_native_promql: true,
+                parallelism: 4,
                 ..Default::default()
             })
             .build()
             .await;
     let frontend = instance.fe_instance();
 
-    let sql = "CREATE TABLE native_demo (ts TIMESTAMP TIME INDEX, val DOUBLE, host STRING, PRIMARY KEY (host))";
+    let sql = "CREATE TABLE native_demo (ts TIMESTAMP TIME INDEX, val DOUBLE, host STRING, PRIMARY KEY (host)) WITH ('compaction.type' = 'twcs', 'compaction.twcs.active_window.trigger_file_num' = '100', 'compaction.twcs.inactive_window.trigger_file_num' = '100')";
     execute_sql_and_expect(frontend, sql, "Affected Rows: 0").await;
-    let sql = "INSERT INTO native_demo(host, val, ts) VALUES ('h1', 1.0, 0), ('h1', 2.0, 1000)";
-    execute_sql_and_expect(frontend, sql, "Affected Rows: 2").await;
+    // Four pk-disjoint insert batches, each persisted by its own flush, leave four series batches
+    // behind that the scan can distribute across four partitions; the relaxed TWCS thresholds keep
+    // them from being compacted back into a single unit of work.
+    for (first, second) in [(0, 1), (2, 3), (4, 5), (6, 7)] {
+        let values = [first, second]
+            .into_iter()
+            .map(|host| {
+                format!(
+                    "('h{host}', {}.0, 0), ('h{host}', {}.0, 1000)",
+                    host + 1,
+                    host + 2
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!("INSERT INTO native_demo(host, val, ts) VALUES {values}");
+        execute_sql_and_expect(frontend, &sql, "Affected Rows: 4").await;
+        // Flushing before the next pair keeps every round a separate persisted batch.
+        tests_integration::test_util::execute_sql(frontend, "ADMIN FLUSH_TABLE('native_demo')")
+            .await;
+    }
 
-    // A scalar statement, which reads no raw samples at all, and two shapes over the scan.
-    for query in ["1 + 2", "native_demo * 100", "-native_demo"] {
-        let plan = native_plan_of(frontend, query).await;
+    for (query, expected) in [
+        (
+            "1 + 2",
+            vec![(None, 0, 3.0), (None, 1_000, 3.0), (None, 2_000, 3.0)],
+        ),
+        (
+            "native_demo * 100",
+            (0..8)
+                .flat_map(|host| {
+                    let name = format!("h{host}");
+                    [
+                        (Some(name.clone()), 0, (host + 1) as f64 * 100.0),
+                        (Some(name.clone()), 1_000, (host + 2) as f64 * 100.0),
+                        (Some(name), 2_000, (host + 2) as f64 * 100.0),
+                    ]
+                })
+                .collect(),
+        ),
+        (
+            "-native_demo",
+            (0..8)
+                .flat_map(|host| {
+                    let name = format!("h{host}");
+                    [
+                        (Some(name.clone()), 0, -((host + 1) as f64)),
+                        (Some(name.clone()), 1_000, -((host + 2) as f64)),
+                        (Some(name), 2_000, -((host + 2) as f64)),
+                    ]
+                })
+                .collect(),
+        ),
+    ] {
+        let (plan, rows) = native_query_output(frontend, query).await;
+        assert_eq!(rows, expected, "unexpected result for `{query}`");
+        let display = displayable(plan.as_ref()).indent(true).to_string();
+
+        if query == "1 + 2" {
+            assert!(display.contains("FusedSeriesExec"), "{display}");
+            continue;
+        }
+
+        assert!(display.contains("MergeScanExec"), "{query}: {display}");
+        let stages = query::analyze_plan_metrics_to_json_value(&plan, true).unwrap();
+        let stage_one = stages
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|stage| stage["stage"] == 1)
+            .collect::<Vec<_>>();
+        fn find_node<'a>(node: &'a Value, name: &str) -> Option<&'a Value> {
+            if node["name"] == name {
+                return Some(node);
+            }
+            node.get("children")
+                .and_then(Value::as_array)
+                .and_then(|children| children.iter().find_map(|child| find_node(child, name)))
+        }
+        let fused = stage_one
+            .iter()
+            .find_map(|stage| find_node(&stage["plan"], "FusedSeriesExec"));
+        assert!(fused.is_some(), "{query}: {stage_one:?}");
         assert!(
-            plan.contains("FusedSeriesExec"),
-            "`{query}` did not reach the native route: {plan}"
+            stage_one
+                .iter()
+                .any(|stage| find_node(&stage["plan"], "SeriesScanExec").is_some()),
+            "{query}: {stage_one:?}"
         );
+        assert_eq!(stage_one.len(), 1, "expected one region: {stage_one:?}");
+        assert!(
+            find_node(&stage_one[0]["plan"], "SeriesScanExec").unwrap()["param"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("partitions=4"),
+            "{query}: {stage_one:?}"
+        );
+        let fused = fused.unwrap();
+        assert_eq!(
+            fused["metrics"]["native.root.output_values"]
+                .as_u64()
+                .unwrap_or_default(),
+            24,
+            "{query}: {stage_one:?}"
+        );
+        assert!(
+            fused["metrics"]["native.root.output_batches"]
+                .as_u64()
+                .unwrap_or_default()
+                > 0,
+            "{query}: {stage_one:?}"
+        );
+        let input_side = if query.starts_with('-') {
+            "right"
+        } else {
+            "left"
+        };
+        for partition in 0..4 {
+            let root_peak = format!("native.p{partition}.root.peak_reserved_bytes");
+            let input_peak =
+                format!("native.p{partition}.root.{input_side}.input.peak_reserved_bytes");
+            assert!(
+                fused["metrics"][&root_peak].as_u64().unwrap_or_default() > 0,
+                "partition {partition} did no native work: {stage_one:?}"
+            );
+            assert!(
+                fused["metrics"][&input_peak].as_u64().unwrap_or_default() > 0,
+                "partition {partition} input did no work: {stage_one:?}"
+            );
+        }
     }
 }
 
-/// The physical plan the frontend actually executed for `query`.
-async fn native_plan_of(frontend: &Arc<Instance>, query: &str) -> String {
+/// Runs a native range query and collects its complete result alongside its executed plan.
+async fn native_query_output(
+    frontend: &Arc<Instance>,
+    query: &str,
+) -> (
+    Arc<dyn datafusion::physical_plan::ExecutionPlan>,
+    Vec<(Option<String>, i64, f64)>,
+) {
     let query_ctx = QueryContextBuilder::default()
         .set_extension(
             "query.experimental_native_promql".to_string(),
@@ -1586,8 +1693,8 @@ async fn native_plan_of(frontend: &Arc<Instance>, query: &str) -> String {
     let prom_query = PromQuery {
         query: query.to_string(),
         start: "0".to_string(),
-        end: "1000".to_string(),
-        step: "1000".to_string(),
+        end: "2".to_string(),
+        step: "1s".to_string(),
         ..Default::default()
     };
     let outputs =
@@ -1600,8 +1707,56 @@ async fn native_plan_of(frontend: &Arc<Instance>, query: &str) -> String {
     let plan = output
         .meta
         .plan
-        .expect("a PromQL query reports the plan it ran");
-    displayable(plan.as_ref()).indent(true).to_string()
+        .clone()
+        .expect("query reports executed plan");
+    let output_data = match output.data {
+        common_query::OutputData::RecordBatches(batches) => batches,
+        common_query::OutputData::Stream(stream) => {
+            common_recordbatch::RecordBatches::try_collect(stream)
+                .await
+                .unwrap_or_else(|error| panic!("`{query}` result collection failed: {error}"))
+        }
+        common_query::OutputData::AffectedRows(rows) => {
+            panic!("`{query}` returned affected rows: {rows}")
+        }
+    };
+    let mut rows = Vec::new();
+    for batch in output_data.iter() {
+        let batch = batch.df_record_batch();
+        let timestamps = batch
+            .columns()
+            .iter()
+            .find_map(|column| column.as_any().downcast_ref::<TimestampMillisecondArray>())
+            .expect("range result has a millisecond timestamp column");
+        let values = batch
+            .columns()
+            .iter()
+            .find_map(|column| column.as_any().downcast_ref::<Float64Array>())
+            .expect("range result has a Float64 value column");
+        rows.extend((0..batch.num_rows()).map(|row| {
+            assert!(timestamps.is_valid(row), "null timestamp in `{query}`");
+            assert!(values.is_valid(row), "null value in `{query}`");
+            // Select the host by name: a scalar result has no host column, a series result has
+            // exactly this one, and picking the first string column would silently pass for it.
+            let host = batch.column_by_name("host").map(|column| {
+                if let Some(array) = column.as_any().downcast_ref::<StringArray>() {
+                    assert!(array.is_valid(row), "null host in `{query}`");
+                    array.value(row).to_string()
+                } else if let Some(array) = column.as_any().downcast_ref::<StringViewArray>() {
+                    assert!(array.is_valid(row), "null host in `{query}`");
+                    array.value(row).to_string()
+                } else {
+                    panic!(
+                        "`{query}` host column is not a string: {}",
+                        column.data_type()
+                    );
+                }
+            });
+            (host, timestamps.value(row), values.value(row))
+        }));
+    }
+    rows.sort_unstable_by(|left, right| left.0.cmp(&right.0).then(left.1.cmp(&right.1)));
+    (plan, rows)
 }
 
 pub async fn test_prometheus_label_replace_response(store_type: StorageType) {

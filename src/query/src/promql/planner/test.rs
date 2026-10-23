@@ -1931,7 +1931,14 @@ async fn native_fused_tag_partitioned_table_still_plans_fused_series() {
 
 #[tokio::test]
 async fn native_fused_binary_vector_scalar_has_raw_input() {
-    let plan = build_native_fused_plan("some_metric * 100", true).await;
+    // The native engine, because the route declines every other one: a fixture on the blank engine
+    // would fall back for a reason this test does not mean to exercise.
+    let plan = build_native_fused_plan_with_provider(
+        "some_metric * 100",
+        true,
+        native_engine_provider(vec![]).await,
+    )
+    .await;
     let display = plan.display_indent().to_string();
     assert!(
         display.contains("FusedSeries: some_metric * 100"),
@@ -1942,7 +1949,12 @@ async fn native_fused_binary_vector_scalar_has_raw_input() {
 
 #[tokio::test]
 async fn native_fused_unary_vector_has_raw_input() {
-    let plan = build_native_fused_plan("-some_metric", true).await;
+    let plan = build_native_fused_plan_with_provider(
+        "-some_metric",
+        true,
+        native_engine_provider(vec![]).await,
+    )
+    .await;
     let display = plan.display_indent().to_string();
     assert!(display.contains("FusedSeries: -some_metric"), "{display}");
     assert!(find_fused_series(&plan).unwrap().input().is_some());
@@ -1991,7 +2003,12 @@ async fn native_fused_scalar_statement_has_no_input_and_matching_schema() {
 #[tokio::test]
 async fn native_fused_flag_off_keeps_scalar_and_vector_scalar_plans() {
     for query in ["1 + 2", "some_metric * 100"] {
-        let plan = build_native_fused_plan(query, false).await;
+        let plan = build_native_fused_plan_with_provider(
+            query,
+            false,
+            native_engine_provider(vec![]).await,
+        )
+        .await;
         let display = plan.display_indent().to_string();
         assert!(!display.contains("FusedSeries"), "{display}");
     }

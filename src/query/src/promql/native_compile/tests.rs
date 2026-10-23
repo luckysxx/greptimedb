@@ -38,7 +38,7 @@ use promql_parser::parser::{
     VectorMatchFillValues,
 };
 
-use super::compile;
+use super::{compile, compile_statement};
 
 /// The raw series schema a caller binds from the table: one field and no evaluation grid.
 fn raw_schema() -> Arc<SeriesSchema> {
@@ -211,6 +211,28 @@ fn scalar_grid(node: &NativeNode) -> (i64, i64, u64) {
     };
     let spec = grid.spec();
     (spec.start_ms, spec.step_ms, spec.len)
+}
+
+#[test]
+fn compile_statement_accepts_only_constant_scalar_expressions() {
+    let stmt = eval_stmt("1 + 2");
+    let tree = compile_statement(&stmt).expect("constant expression compiles");
+    assert!(matches!(&tree.root().expr, NativeExpr::Scalar(_)));
+    assert_eq!(scalar_grid(tree.root()), (0, 5_000, 21));
+    let NativeExpr::Scalar(scalar) = &tree.root().expr else {
+        unreachable!("constant statement is scalar")
+    };
+    assert_eq!(scalar.value, 3.0);
+    assert!(!tree.to_string().contains("Input"));
+
+    for query in ["x", "scalar(x)"] {
+        let error = compile_statement(&eval_stmt(query)).expect_err("nonconstant is refused");
+        assert!(
+            matches!(error, DataFusionError::NotImplemented(_)),
+            "{error}"
+        );
+        assert!(error.to_string().contains(query), "{error}");
+    }
 }
 
 /// The input and the operation of an `Aggregate` node.

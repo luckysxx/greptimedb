@@ -237,7 +237,7 @@ pub fn compile(
     }
     let context = Context {
         stmt,
-        input: Some(input),
+        input,
         ordering,
         // The grid is built once for the whole compilation rather than per node: every node of a
         // tree without a subquery lands on this one, and a subquery replaces it for its own subtree.
@@ -249,15 +249,15 @@ pub fn compile(
     NativeTree::try_new(compile_expr(&context, &stmt.expr)?)
 }
 
-/// Compiles a statement that reads no raw samples: every node it binds is a scalar.
+/// Compiles a constant statement to a scalar on the statement grid.
 pub fn compile_statement(stmt: &EvalStmt) -> Result<NativeTree> {
-    let context = Context {
-        stmt,
-        input: None,
-        ordering: SeriesOrdering::KeyThenTime,
-        grid: statement_grid(stmt)?,
-    };
-    NativeTree::try_new(compile_expr(&context, &stmt.expr)?)
+    let value = constant_value(&stmt.expr)
+        .ok_or_else(|| not_implemented(&format!("the expression `{}`", stmt.expr)))?;
+    let grid = statement_grid(stmt)?;
+    NativeTree::try_new(NativeNode {
+        expr: NativeExpr::Scalar(BoundScalar { value }),
+        output: NativeType::Scalar(grid),
+    })
 }
 
 /// What every node of one compilation derives from the statement rather than from the expression.
@@ -269,7 +269,7 @@ struct Context<'a> {
     /// The statement being compiled.
     stmt: &'a EvalStmt,
     /// The raw series the caller bound; shared by every input node rather than copied per node.
-    input: Option<Arc<SeriesSchema>>,
+    input: Arc<SeriesSchema>,
     /// The ordering the caller's scan guarantees.
     ordering: SeriesOrdering,
     /// The grid the expression being compiled is evaluated on.
@@ -508,11 +508,6 @@ fn binary_op(op: &TokenType) -> Option<BinaryOp> {
 /// The stage is [`AggregateStage::Complete`], which says that every contribution to each group is in
 /// this execution's input. The module documentation says what keeping that claim costs a caller.
 fn aggregate_expr(context: &Context, aggregate: &AggregateExpr) -> Result<NativeNode> {
-    if context.input.is_none() {
-        return Err(not_implemented(&format!(
-            "the aggregate `{aggregate}` in a statement that reads no raw samples"
-        )));
-    }
     let AggregateExpr {
         op,
         expr,
@@ -738,13 +733,6 @@ fn window_call(
 /// The only comparison by identity is an input node's, whose output has to be the very binding it
 /// was bound to.
 fn map_call(context: &Context, name: &str, op: MapOp, vector: &PromExpr) -> Result<NativeNode> {
-    // A statement that reads no raw samples has nothing for a map to be pointwise over, so the
-    // call is declined here: the planner falls back to the existing one.
-    if context.input.is_none() {
-        return Err(not_implemented(&format!(
-            "the map `{name}({vector})` in a statement that reads no raw samples"
-        )));
-    }
     // A map is pointwise over a vector, so the function's first argument has to be one. The parser
     // checks the same thing and the tree's validation checks the compiled input's type again, but
     // neither can name the argument the client wrote: this is the check that can.
@@ -921,11 +909,6 @@ fn window_selection(
     vs: &VectorSelector,
     range: &Duration,
 ) -> Result<NativeNode> {
-    let input = context.input.as_ref().ok_or_else(|| {
-        not_implemented(&format!(
-            "the range-window selection `{vs}[{range:?}]` in a statement that reads no raw samples"
-        ))
-    })?;
     // An `@` anchor is step-invariant: every step folds the same samples, which the window's
     // `anchor_ms` tells `RangeEvaluator` to replay over the grid.
     let range_ms = range_millis(range.as_millis())?;
@@ -937,14 +920,14 @@ fn window_selection(
 
     // A range function reports one value per input field, so the layout is the input's.
     let output = NativeType::Samples(Arc::new(SeriesSchema {
-        fields: Arc::clone(&input.fields),
+        fields: Arc::clone(&context.input.fields),
         eval_grid: Some(Arc::clone(&output_grid)),
     }));
 
     // One allocation shared by the binding and the node's output: `NativeTree::try_new` compares
     // them by identity, because a compiler that meant one schema has no reason to allocate it
     // twice.
-    let raw = NativeType::Samples(Arc::clone(input));
+    let raw = NativeType::Samples(Arc::clone(&context.input));
 
     Ok(NativeNode {
         expr: NativeExpr::Window {
@@ -998,13 +981,6 @@ fn subquery_window(
     function: RangeFunction,
     subquery: &SubqueryExpr,
 ) -> Result<NativeNode> {
-    // A subquery evaluates its inner expression, which reads the same raw samples the statement
-    // does: without them there is nothing to evaluate on the child grid.
-    let input = context.input.as_ref().ok_or_else(|| {
-        not_implemented(&format!(
-            "the subquery `{subquery}` in a statement that reads no raw samples"
-        ))
-    })?;
     let SubqueryExpr {
         expr,
         range,
@@ -1057,7 +1033,7 @@ fn subquery_window(
     let inner = compile_expr(
         &Context {
             stmt: context.stmt,
-            input: Some(Arc::clone(input)),
+            input: Arc::clone(&context.input),
             ordering: context.ordering,
             grid: Arc::clone(&child_grid),
         },
@@ -1067,7 +1043,7 @@ fn subquery_window(
     // A range function reports one value per input field, and the inner expression reports one per
     // field of the same raw input, so the layout is the input's.
     let output = NativeType::Samples(Arc::new(SeriesSchema {
-        fields: Arc::clone(&input.fields),
+        fields: Arc::clone(&context.input.fields),
         eval_grid: Some(Arc::clone(&context.grid)),
     }));
 
@@ -1092,13 +1068,6 @@ fn subquery_window(
 /// The lookback, the offset and the grid are the whole of an instant selection: it reports the last
 /// sample at or before each grid point, within the statement's lookback.
 fn instant_selection(context: &Context, selector: &VectorSelector) -> Result<NativeNode> {
-    // A selection reads the caller's raw samples, so a statement compiled without them has nothing
-    // to select from. Refusing names the shape rather than building an input node nothing feeds.
-    let input = context.input.as_ref().ok_or_else(|| {
-        not_implemented(&format!(
-            "the selector `{selector}` in a statement that reads no raw samples"
-        ))
-    })?;
     // An `@` anchor is bound on a range window, which carries `anchor_ms`; an instant selection has
     // no such field, so the anchor has nowhere to go. Refusing it is the only alternative to
     // dropping it, which would silently select around every grid point instead of one anchor.
@@ -1115,12 +1084,12 @@ fn instant_selection(context: &Context, selector: &VectorSelector) -> Result<Nat
 
     // An instant selection reports one value per input field, so the layout is the input's.
     let output = NativeType::Samples(Arc::new(SeriesSchema {
-        fields: Arc::clone(&input.fields),
+        fields: Arc::clone(&context.input.fields),
         eval_grid: Some(Arc::clone(&output_grid)),
     }));
 
     // One allocation shared by the binding and the node's output, as in the window shape.
-    let raw = NativeType::Samples(Arc::clone(input));
+    let raw = NativeType::Samples(Arc::clone(&context.input));
 
     Ok(NativeNode {
         expr: NativeExpr::Instant {

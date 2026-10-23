@@ -787,7 +787,7 @@ pub async fn setup_test_prom_app_with_frontend(
     store_type: StorageType,
     name: &str,
 ) -> (Router, TestGuard) {
-    setup_test_prom_app_with_frontend_inner(store_type, name, false, None).await
+    setup_test_prom_app_with_frontend_inner(store_type, name, false, None, None).await
 }
 
 /// Like [`setup_test_prom_app_with_frontend`] but enables the pending-rows batcher,
@@ -797,7 +797,7 @@ pub async fn setup_test_prom_app_with_frontend_batched(
     store_type: StorageType,
     name: &str,
 ) -> (Router, TestGuard) {
-    setup_test_prom_app_with_frontend_inner(store_type, name, true, None).await
+    setup_test_prom_app_with_frontend_inner(store_type, name, true, None, None).await
 }
 
 /// Like [`setup_test_prom_app_with_frontend`] but wires a shared request-memory
@@ -808,7 +808,7 @@ pub async fn setup_test_prom_app_with_frontend_and_memory_limiter(
     name: &str,
     memory_limiter: Option<ServerMemoryLimiter>,
 ) -> (Router, TestGuard) {
-    setup_test_prom_app_with_frontend_inner(store_type, name, false, memory_limiter).await
+    setup_test_prom_app_with_frontend_inner(store_type, name, false, memory_limiter, None).await
 }
 
 /// Like [`setup_test_prom_app_with_frontend`] but with the native PromQL route enabled server-side.
@@ -820,7 +820,7 @@ pub async fn setup_test_prom_app_with_frontend_and_native_promql(
     store_type: StorageType,
     name: &str,
 ) -> (Router, TestGuard) {
-    setup_test_prom_app_with_frontend_inner_with(
+    setup_test_prom_app_with_frontend_inner(
         store_type,
         name,
         false,
@@ -834,22 +834,6 @@ pub async fn setup_test_prom_app_with_frontend_and_native_promql(
 }
 
 async fn setup_test_prom_app_with_frontend_inner(
-    store_type: StorageType,
-    name: &str,
-    enable_batcher: bool,
-    memory_limiter: Option<ServerMemoryLimiter>,
-) -> (Router, TestGuard) {
-    setup_test_prom_app_with_frontend_inner_with(
-        store_type,
-        name,
-        enable_batcher,
-        memory_limiter,
-        None,
-    )
-    .await
-}
-
-async fn setup_test_prom_app_with_frontend_inner_with(
     store_type: StorageType,
     name: &str,
     enable_batcher: bool,

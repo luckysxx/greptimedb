@@ -494,7 +494,6 @@ fn source_runtime(pool: &Arc<dyn MemoryPool>) -> NodeRuntime {
         aggregate: None,
         broadcast: None,
         vector: None,
-        scalar_emitted: false,
         source_schema: None,
         emitted: None,
         merge: None,
@@ -518,7 +517,6 @@ fn binary_runtime(pool: &Arc<dyn MemoryPool>, schema: &Arc<SeriesSchema>) -> Nod
         aggregate: None,
         broadcast: None,
         vector: None,
-        scalar_emitted: false,
         source_schema: None,
         emitted: None,
         merge: None,
@@ -715,7 +713,7 @@ fn scalar_root_emits_one_unlabelled_grid_chunk() {
     let chunk = execution.next_chunk().unwrap().unwrap();
     assert_eq!(
         chunk.series.metric,
-        MetricName::try_new(None, Vec::new()).unwrap()
+        SeriesLabels::try_new(None, Vec::new()).unwrap()
     );
     assert_eq!(chunk.series.fields.len(), 1);
     assert_eq!(sample_values(&chunk), vec![Some(2.5); 3]);
@@ -728,6 +726,60 @@ fn scalar_root_emits_one_unlabelled_grid_chunk() {
     assert!(execution.next_chunk().unwrap().is_none());
     assert_eq!(execution.state().reserved_bytes(), 0);
     assert_eq!(pool.reserved(), 0);
+}
+
+#[test]
+fn scalar_root_reserves_before_allocating_and_records_output_metrics() {
+    let grid = grid(0, 1, 4);
+    let tree = NativeTree::try_new(scalar(2.0, Arc::clone(&grid))).unwrap();
+    let zero_pool = bounded_pool(0);
+    let mut rejected = executor(
+        &tree,
+        Arc::clone(&zero_pool),
+        &ExecutionPlanMetricsSet::new(),
+    );
+    let error = rejected.next_chunk().unwrap_err();
+    assert!(error.to_string().contains("memory"), "{error}");
+    assert_eq!(rejected.state().reserved_bytes(), 0);
+    assert_eq!(zero_pool.reserved(), 0);
+
+    let pool = pool();
+    let metrics = ExecutionPlanMetricsSet::new();
+    let mut execution = executor(&tree, Arc::clone(&pool), &metrics);
+    let chunk = execution.next_chunk().unwrap().unwrap();
+    assert_eq!(sample_values(&chunk), vec![Some(2.0); 4]);
+    assert!(execution.next_chunk().unwrap().is_none());
+    assert_eq!(pool.reserved(), 0);
+    let peak = NodePath::root().partitioned_metric_name(NodeMetric::PEAK_RESERVED_BYTES, 0);
+    assert!(gauge(&metrics, &peak) >= 4 * std::mem::size_of::<f64>());
+    assert_eq!(
+        count(&metrics, &NodePath::root(), NodeMetric::OUTPUT_BATCHES),
+        1
+    );
+    assert_eq!(
+        count(&metrics, &NodePath::root(), NodeMetric::OUTPUT_VALUES),
+        4
+    );
+    assert_eq!(
+        count(
+            &metrics,
+            &NodePath::root(),
+            NodeMetric::EVALUATED_GRID_POINTS
+        ),
+        4
+    );
+    assert_eq!(
+        count(&metrics, &NodePath::root(), NodeMetric::COMPLETED_SERIES),
+        1
+    );
+    assert_eq!(
+        count(&metrics, &NodePath::root(), NodeMetric::INPUT_BATCHES),
+        0
+    );
+    assert_eq!(
+        count(&metrics, &NodePath::root(), NodeMetric::INPUT_SAMPLES),
+        0
+    );
 }
 
 #[test]
