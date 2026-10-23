@@ -92,7 +92,9 @@ fn map_over(inner: NativeNode, ops: Vec<MathOp>) -> NativeNode {
     NativeNode {
         expr: NativeExpr::Map {
             input: Box::new(inner),
-            op: crate::native::plan::BoundMap { ops: ops.into() },
+            op: crate::native::plan::BoundMap {
+                ops: ops.into_iter().map(MapOp::Math).collect::<Vec<_>>().into(),
+            },
         },
         output,
     }

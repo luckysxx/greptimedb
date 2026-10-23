@@ -68,8 +68,8 @@ use crate::grid_series::series_bytes;
 use crate::map::MathOp;
 use crate::native::execute::{NativeExecutionState, NativeExecutor};
 use crate::native::plan::{
-    AggregateKind, AggregateStage, BoundAggregate, BoundInput, Grouping, NativeExpr, NativeNode,
-    NativeTree, NativeType,
+    AggregateKind, AggregateStage, BoundAggregate, BoundInput, Grouping, MapOp, NativeExpr,
+    NativeNode, NativeTree, NativeType,
 };
 
 /// One node that merges the partition-local state of a split aggregate.
@@ -460,8 +460,8 @@ fn check_cut(op: &BoundAggregate, fields: &[FieldSpec], time_index: &str) -> DfR
 fn admit_prefix(root: &NativeNode) -> DfResult<()> {
     let mut node = root;
     while let NativeExpr::Map { input, op } = &node.expr {
-        for math in op.ops.iter() {
-            if let MathOp::Clamp { min, max } = math
+        for map_op in op.ops.iter() {
+            if let MapOp::Math(MathOp::Clamp { min, max }) = map_op
                 && max < min
             {
                 return Err(declined("a `clamp` whose maximum is below its minimum"));
