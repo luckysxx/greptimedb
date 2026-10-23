@@ -2097,7 +2097,7 @@ fn scalar_chunk(grid: Arc<EvalGrid>, value: f64) -> Result<EvaluatedChunk> {
     let time = GridRange::try_new(grid, 0, spec.len as usize).map_err(series_error)?;
     let values = Float64Array::from(vec![value; spec.len as usize]);
     let fields = SeriesFields::one(Samples::from_float(values));
-    let metric = SeriesLabels::try_new(None, Vec::new()).map_err(series_error)?;
+    let metric = MetricName::try_new(None, Vec::new()).map_err(series_error)?;
     let series =
         Series::try_new(&schema, metric, TimeAxis::Grid(time), fields).map_err(series_error)?;
     EvaluatedChunk::try_new(series, true)

@@ -713,7 +713,7 @@ fn scalar_root_emits_one_unlabelled_grid_chunk() {
     let chunk = execution.next_chunk().unwrap().unwrap();
     assert_eq!(
         chunk.series.metric,
-        SeriesLabels::try_new(None, Vec::new()).unwrap()
+        MetricName::try_new(None, Vec::new()).unwrap()
     );
     assert_eq!(chunk.series.fields.len(), 1);
     assert_eq!(sample_values(&chunk), vec![Some(2.5); 3]);
