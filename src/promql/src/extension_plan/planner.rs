@@ -24,8 +24,8 @@ use datafusion::physical_planner::{ExtensionPlanner, PhysicalPlanner};
 use table::table::scan::RegionScanExec;
 
 use crate::extension_plan::{
-    Absent, EmptyMetric, FusedSeries, HistogramFold, InstantManipulate, RangeManipulate,
-    ScalarCalculate, SeriesDivide, SeriesNormalize, UnionDistinctOn,
+    Absent, EmptyMetric, FusedExecInput, FusedSeries, HistogramFold, InstantManipulate,
+    RangeManipulate, ScalarCalculate, SeriesDivide, SeriesNormalize, UnionDistinctOn,
 };
 
 pub struct PromExtensionPlanner;
@@ -102,6 +102,11 @@ fn plan_fused_series(
     physical_inputs: &[Arc<dyn ExecutionPlan>],
     target_partitions: usize,
 ) -> DfResult<Option<Arc<dyn ExecutionPlan>>> {
+    // A tree that reads no raw samples has no child, and nothing below this node to resolve: the
+    // answer comes from the statement alone.
+    if fused.input().is_none() {
+        return fused.to_execution_plan(FusedExecInput::None).map(Some);
+    }
     let Some(input) = physical_inputs.first() else {
         return Ok(None);
     };
@@ -162,6 +167,10 @@ fn plan_fused_series(
     let ordering = series_scan.raw_series_ordering();
 
     fused
-        .to_execution_plan(series_scan, label_source, ordering)
+        .to_execution_plan(FusedExecInput::RawSeries {
+            input: series_scan,
+            label_source,
+            ordering,
+        })
         .map(Some)
 }

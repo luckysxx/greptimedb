@@ -39,7 +39,7 @@ use datafusion_expr::Expr;
 use datatypes::series::SeriesOrdering;
 use datatypes::series::samples::{FieldSpec, SeriesSchema};
 use promql::extension_plan::{FusedSeries, FusedSeriesBinding};
-use promql::native::plan::reads_across_series;
+use promql::native::plan::{NativeExpr, NativeType, reads_across_series};
 use promql_parser::parser::value::ValueType;
 use promql_parser::parser::{
     EvalStmt, Expr as PromExpr, MatrixSelector, ParenExpr, VectorSelector,
@@ -49,7 +49,7 @@ use snafu::ResultExt;
 use store_api::metric_engine_consts::{DATA_SCHEMA_TABLE_ID_COLUMN_NAME, METRIC_ENGINE_NAME};
 
 use crate::promql::error::{DataFusionPlanningSnafu, Result};
-use crate::promql::native_compile::{compile, statement_grid};
+use crate::promql::native_compile::{compile, compile_statement, statement_grid};
 use crate::promql::planner::PromPlanner;
 
 /// The query-context key that turns the native fused-series route on for one query.
@@ -119,10 +119,62 @@ impl PromPlanner {
             return Ok(None);
         }
 
-        // A tree reads exactly one raw input, and the scan below the node is that one selector's,
-        // so a shape that names no selector or more than one is not offered at all.
-        let Some(selector) = single_selector(prom_expr) else {
+        if prom_expr.value_type() == ValueType::String {
             return Ok(None);
+        }
+        let mut selectors = Vec::new();
+        collect_selectors(prom_expr, &mut selectors);
+        let selector = match selectors.as_slice() {
+            [selector] => *selector,
+            [] => {
+                let Some(stmt) = self.native_statement(prom_expr) else {
+                    return Ok(None);
+                };
+                let Ok(grid) = statement_grid(&stmt) else {
+                    return Ok(None);
+                };
+                let tree = match compile_statement(&stmt) {
+                    Ok(tree) => tree,
+                    Err(DataFusionError::NotImplemented(_)) => return Ok(None),
+                    Err(error) => return Err(error).context(DataFusionPlanningSnafu),
+                };
+                // Scalar-only statements still need one describable field in the binding, even
+                // though the tree has no raw samples to read.
+                if tree_has_input(tree.root())
+                    || !matches!(&tree.root().output, NativeType::Scalar(_))
+                {
+                    return Ok(None);
+                }
+                let time_index = super::DEFAULT_TIME_INDEX_COLUMN.to_string();
+                let value = super::DEFAULT_FIELD_COLUMN.to_string();
+                let series_schema = Arc::new(SeriesSchema {
+                    fields: vec![FieldSpec {
+                        name: Arc::from(value.as_str()),
+                    }]
+                    .into(),
+                    eval_grid: None,
+                });
+                let binding = FusedSeriesBinding {
+                    series_schema,
+                    grid,
+                    metric_name: None,
+                    time_index: time_index.clone(),
+                    tags: vec![],
+                };
+                let output_schema = fused_output_schema(&[value], &[], &time_index)?;
+                let node = FusedSeries::try_new(
+                    Arc::from(prom_expr.to_string()),
+                    tree,
+                    binding,
+                    None,
+                    output_schema,
+                )
+                .context(DataFusionPlanningSnafu)?;
+                return Ok(Some(LogicalPlan::Extension(Extension {
+                    node: Arc::new(node),
+                })));
+            }
+            _ => return Ok(None),
         };
 
         // Resolve the selector the way the existing planner does, and take what is left as the
@@ -321,7 +373,7 @@ impl PromPlanner {
             Arc::from(prom_expr.to_string()),
             tree,
             binding,
-            input,
+            Some(input),
             output_schema,
         )
         .context(DataFusionPlanningSnafu)?;
@@ -396,14 +448,18 @@ fn fused_output_schema(
 
 /// The one selector `expr` folds, if it names exactly one.
 ///
-/// The walk follows the grammar the native compiler accepts — a call, a range selector, a selector
-/// and parentheses — and stops at every other shape, because a shape the compiler cannot compile
-/// needs no selector resolved. Two distinct selectors are not one input, and a tree built over the
-/// wrong one of them would evaluate a window the query did not write.
+/// The walk follows the grammar the native compiler accepts — calls, range selectors, selectors,
+/// parentheses, unary expressions and both sides of binary expressions. Two distinct selectors are
+/// not one input, and a tree built over the wrong one of them would evaluate a window the query did
+/// not write.
 fn selector_range_millis(expr: &PromExpr) -> Option<i64> {
     match expr {
         PromExpr::MatrixSelector(matrix) => Some(matrix.range.as_millis() as i64),
         PromExpr::Paren(paren) => selector_range_millis(&paren.expr),
+        PromExpr::Unary(unary) => selector_range_millis(&unary.expr),
+        PromExpr::Binary(binary) => {
+            selector_range_millis(&binary.lhs).or_else(|| selector_range_millis(&binary.rhs))
+        }
         PromExpr::Call(call) => call
             .args
             .args
@@ -455,12 +511,15 @@ fn metric_scan_and_table_id(
     Some((scan.clone(), filter.predicate.clone()))
 }
 
-fn single_selector(expr: &PromExpr) -> Option<&VectorSelector> {
-    let mut selectors = Vec::new();
-    collect_selectors(expr, &mut selectors);
-    match selectors.as_slice() {
-        [only] => Some(only),
-        _ => None,
+fn tree_has_input(node: &promql::native::plan::NativeNode) -> bool {
+    match &node.expr {
+        NativeExpr::Input(_) => true,
+        NativeExpr::Scalar(_) => false,
+        NativeExpr::Instant { input, .. }
+        | NativeExpr::Window { input, .. }
+        | NativeExpr::Map { input, .. }
+        | NativeExpr::Aggregate { input, .. } => tree_has_input(input),
+        NativeExpr::Binary { left, right, .. } => tree_has_input(left) || tree_has_input(right),
     }
 }
 
@@ -469,6 +528,11 @@ fn collect_selectors<'a>(expr: &'a PromExpr, out: &mut Vec<&'a VectorSelector>) 
         PromExpr::VectorSelector(selector) => out.push(selector),
         PromExpr::MatrixSelector(MatrixSelector { vs, .. }) => out.push(vs),
         PromExpr::Paren(ParenExpr { expr }) => collect_selectors(expr, out),
+        PromExpr::Unary(unary) => collect_selectors(&unary.expr, out),
+        PromExpr::Binary(binary) => {
+            collect_selectors(&binary.lhs, out);
+            collect_selectors(&binary.rhs, out);
+        }
         PromExpr::Call(call) => {
             // A label rewrite adds a label the node's output schema cannot declare: that schema is
             // built from the table's own tags, so folding `label_replace`/`label_join` in would

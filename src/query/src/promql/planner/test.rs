@@ -1929,6 +1929,74 @@ async fn native_fused_tag_partitioned_table_still_plans_fused_series() {
     assert!(plan.display_indent().to_string().contains("FusedSeries"));
 }
 
+#[tokio::test]
+async fn native_fused_binary_vector_scalar_has_raw_input() {
+    let plan = build_native_fused_plan("some_metric * 100", true).await;
+    let display = plan.display_indent().to_string();
+    assert!(
+        display.contains("FusedSeries: some_metric * 100"),
+        "{display}"
+    );
+    assert!(find_fused_series(&plan).unwrap().input().is_some());
+}
+
+#[tokio::test]
+async fn native_fused_unary_vector_has_raw_input() {
+    let plan = build_native_fused_plan("-some_metric", true).await;
+    let display = plan.display_indent().to_string();
+    assert!(display.contains("FusedSeries: -some_metric"), "{display}");
+    assert!(find_fused_series(&plan).unwrap().input().is_some());
+}
+
+#[tokio::test]
+async fn native_fused_scalar_statement_has_no_input_and_matching_schema() {
+    let plan = build_native_fused_plan("1 + 2", true).await;
+    let display = plan.display_indent().to_string();
+    assert!(display.contains("FusedSeries: 1 + 2"), "{display}");
+    assert!(find_fused_series(&plan).unwrap().input().is_none());
+
+    // The two routes have to hand the client the same table. What is compared is the columns — name,
+    // type and nullability — rather than the whole `DFSchema`: a logical qualifier names where a
+    // column came from, and the scalar route's columns come from no table at all, so requiring the
+    // same qualifier would compare provenance rather than output. The physical schema, which is what
+    // a batch carries and the JSON writer reads, has no qualifier either way.
+    let fallback = build_native_fused_plan("1 + 2", false).await;
+    let columns = |plan: &LogicalPlan| {
+        plan.schema()
+            .fields()
+            .iter()
+            .map(|field| {
+                (
+                    field.name().clone(),
+                    field.data_type().clone(),
+                    field.is_nullable(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(columns(&plan), columns(&fallback));
+    assert_eq!(
+        columns(&plan),
+        vec![
+            (
+                "time".to_string(),
+                ArrowDataType::Timestamp(ArrowTimeUnit::Millisecond, None),
+                false
+            ),
+            ("value".to_string(), ArrowDataType::Float64, true),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn native_fused_flag_off_keeps_scalar_and_vector_scalar_plans() {
+    for query in ["1 + 2", "some_metric * 100"] {
+        let plan = build_native_fused_plan(query, false).await;
+        let display = plan.display_indent().to_string();
+        assert!(!display.contains("FusedSeries"), "{display}");
+    }
+}
+
 /// Metric logical scans retain their table-id restriction on the direct fused scan input.
 #[tokio::test]
 async fn native_fused_metric_engine_table_is_accepted() {

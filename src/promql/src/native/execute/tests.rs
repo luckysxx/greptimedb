@@ -494,6 +494,7 @@ fn source_runtime(pool: &Arc<dyn MemoryPool>) -> NodeRuntime {
         aggregate: None,
         broadcast: None,
         vector: None,
+        scalar_emitted: false,
         source_schema: None,
         emitted: None,
         merge: None,
@@ -517,6 +518,7 @@ fn binary_runtime(pool: &Arc<dyn MemoryPool>, schema: &Arc<SeriesSchema>) -> Nod
         aggregate: None,
         broadcast: None,
         vector: None,
+        scalar_emitted: false,
         source_schema: None,
         emitted: None,
         merge: None,
@@ -701,6 +703,55 @@ fn run(executor: &mut NativeExecutor) -> Vec<EvaluatedChunk> {
     }
     out.extend(executor.finish().unwrap());
     out
+}
+
+#[test]
+fn scalar_root_emits_one_unlabelled_grid_chunk() {
+    let grid = grid(10, 5, 3);
+    let tree = NativeTree::try_new(scalar(2.5, Arc::clone(&grid))).unwrap();
+    let pool = pool();
+    let mut execution = executor(&tree, Arc::clone(&pool), &ExecutionPlanMetricsSet::new());
+    execution.end_of_input().unwrap();
+    let chunk = execution.next_chunk().unwrap().unwrap();
+    assert_eq!(
+        chunk.series.metric,
+        MetricName::try_new(None, Vec::new()).unwrap()
+    );
+    assert_eq!(chunk.series.fields.len(), 1);
+    assert_eq!(sample_values(&chunk), vec![Some(2.5); 3]);
+    assert!(chunk.is_last);
+    assert_eq!(chunk.series.time.len(), 3);
+    assert_eq!(
+        chunk.series.time.timestamps().unwrap().as_ref(),
+        grid.timestamps().unwrap().as_ref()
+    );
+    assert!(execution.next_chunk().unwrap().is_none());
+    assert_eq!(execution.state().reserved_bytes(), 0);
+    assert_eq!(pool.reserved(), 0);
+}
+
+#[test]
+fn scalar_root_pull_before_end_of_input_emits_without_finishing() {
+    let tree = NativeTree::try_new(scalar(3.0, grid(0, 1, 3))).unwrap();
+    let mut execution = executor(&tree, pool(), &ExecutionPlanMetricsSet::new());
+    assert_eq!(
+        sample_values(&execution.next_chunk().unwrap().unwrap()),
+        vec![Some(3.0); 3]
+    );
+    assert!(execution.next_chunk().unwrap().is_none());
+    execution.end_of_input().unwrap();
+    assert!(execution.next_chunk().unwrap().is_none());
+}
+
+#[test]
+fn scalar_root_preserves_nan_and_negative_zero() {
+    for value in [f64::NAN, -0.0] {
+        let tree = NativeTree::try_new(scalar(value, grid(0, 1, 1))).unwrap();
+        let mut execution = executor(&tree, pool(), &ExecutionPlanMetricsSet::new());
+        execution.end_of_input().unwrap();
+        let actual = sample_values(&execution.next_chunk().unwrap().unwrap())[0].unwrap();
+        assert_eq!(actual.to_bits(), value.to_bits());
+    }
 }
 
 fn sample_values(chunk: &EvaluatedChunk) -> Vec<Option<f64>> {

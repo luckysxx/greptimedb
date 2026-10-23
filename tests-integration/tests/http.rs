@@ -46,8 +46,10 @@ use common_frontend::slow_query_event::{
 };
 use common_memory_manager::OnExhaustedPolicy;
 use common_options::plugin_options::StandaloneFlag;
+use datafusion::physical_plan::displayable;
 use flate2::Compression;
 use flate2::write::GzEncoder;
+use frontend::instance::Instance;
 use log_query::{AggFunc, Context, Limit, LogExpr, LogQuery, TimeFilter};
 use loki_proto::logproto::{EntryAdapter, LabelPairAdapter, PushRequest, StreamAdapter};
 use loki_proto::prost_types::Timestamp;
@@ -62,6 +64,8 @@ use pipeline::{
     GREPTIME_INTERNAL_TRACE_PIPELINE_V1_NAME, GREPTIME_INTERNAL_TRACE_PIPELINE_V2_NAME,
 };
 use prost::Message;
+use query::options::QueryOptions;
+use query::parser::PromQuery;
 use rstest_reuse::apply;
 use serde_json::{Value, json};
 use servers::http::handler::HealthResponse;
@@ -82,18 +86,19 @@ use servers::http::{GreptimeQueryOutput, HttpOptions, HttpServerBuilder};
 use servers::prom_remote_write::v2::test_util as remote_write_v2;
 use servers::prom_remote_write::validation::PromValidationMode;
 use servers::prom_store::{self, mock_timeseries_new_label};
+use servers::query_handler::sql::SqlQueryHandler;
 use servers::request_memory_limiter::ServerMemoryLimiter;
-use session::context::QueryContextRef;
+use session::context::{QueryContextBuilder, QueryContextRef};
 use standalone::options::StandaloneOptions;
 use table::table_name::TableName;
 use tests_integration::test_util::{
     MockInstanceImpl, StorageType, TestGuard, assert_wal_delta, build_test_prom_server,
-    setup_test_http_app, setup_test_http_app_with_frontend,
+    execute_sql_and_expect, setup_test_http_app, setup_test_http_app_with_frontend,
     setup_test_http_app_with_frontend_and_custom_options,
     setup_test_http_app_with_frontend_and_slow_query_threshold,
     setup_test_http_app_with_frontend_and_user_provider, setup_test_prom_app_with_frontend,
     setup_test_prom_app_with_frontend_and_memory_limiter,
-    setup_test_prom_app_with_frontend_batched,
+    setup_test_prom_app_with_frontend_and_native_promql, setup_test_prom_app_with_frontend_batched,
 };
 use urlencoding::encode;
 use yaml_rust::YamlLoader;
@@ -165,6 +170,8 @@ macro_rules! http_tests {
                 test_http_analyze_stream_tql,
                 test_http_sql_slow_query,
                 test_prometheus_promql_api,
+                test_prometheus_native_promql_route,
+                test_native_promql_route_plans_the_query,
                 test_promql_over_non_millisecond_physical_tables,
                 test_prometheus_label_replace_response,
                 test_prom_http_api,
@@ -1444,6 +1451,157 @@ pub async fn test_prometheus_promql_api(store_type: StorageType) {
     );
 
     guard.remove_all().await;
+}
+
+/// The native PromQL route answers the same public responses as the existing one.
+///
+/// What is checked is the HTTP body, not the plan: the route is enabled server-side here and asked
+/// for per query, and a scalar statement and a scalar broadcast each have to reach the client with
+/// the values and shape the existing planner produces. The scalar case is the one the two routes
+/// could not historically share - the native route reads no samples at all - so `1 + 1` is the case
+/// worth pinning first.
+pub async fn test_prometheus_native_promql_route(store_type: StorageType) {
+    let (app, mut guard) =
+        setup_test_prom_app_with_frontend_and_native_promql(store_type, "promql_native_route")
+            .await;
+    let client = TestClient::new(app).await;
+    let hints = ("x-greptime-hints", "query.experimental_native_promql=true");
+
+    // A plain table, because the route declines a metric-engine table whose partition columns are
+    // not all selector tags: the scan below the node has to be the selector's own.
+    let sql = "CREATE TABLE native_demo (ts TIMESTAMP TIME INDEX, val DOUBLE, host STRING, PRIMARY KEY (host))";
+    let res = client
+        .get(&format!("/v1/sql?db=public&sql={}", encode(sql)))
+        .send()
+        .await;
+    assert_eq!(res.status(), StatusCode::OK, "{sql}");
+    let sql = "INSERT INTO native_demo(host, val, ts) VALUES ('h1', 1.0, 0), ('h1', 2.0, 1000)";
+    let res = client
+        .get(&format!("/v1/sql?db=public&sql={}", encode(sql)))
+        .send()
+        .await;
+    assert_eq!(res.status(), StatusCode::OK, "{sql}");
+
+    // A scalar statement reads no raw samples at all.
+    let res = client
+        .get("/v1/prometheus/api/v1/query?query=1%2B1&time=1")
+        .header(hints.0, hints.1)
+        .send()
+        .await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = serde_json::from_str::<PrometheusJsonResponse>(&res.text().await).unwrap();
+    assert_eq!(body.status, "success");
+    assert_eq!(
+        body.data,
+        serde_json::from_value::<PrometheusResponse>(
+            json!({"resultType":"scalar","result":[1.0,"2.0"]})
+        )
+        .unwrap()
+    );
+
+    // A scalar broadcast over a selector, asked with the route on and off: both answer from the
+    // table, and they have to agree, because the fallback is what the client would otherwise get.
+    let query = encode("native_demo * 100");
+    let native = client
+        .get(&format!(
+            "/v1/prometheus/api/v1/query?query={query}&time=1000"
+        ))
+        .header(hints.0, hints.1)
+        .send()
+        .await;
+    let native_status = native.status();
+    let native_text = native.text().await;
+    assert_eq!(
+        native_status,
+        StatusCode::OK,
+        "`native_demo * 100` with the route on: {native_text}"
+    );
+    let native = serde_json::from_str::<PrometheusJsonResponse>(&native_text).unwrap();
+    assert_eq!(native.status, "success", "{native_text}");
+
+    let fallback = client
+        .get(&format!(
+            "/v1/prometheus/api/v1/query?query={query}&time=1000"
+        ))
+        .send()
+        .await;
+    let fallback_status = fallback.status();
+    let fallback_text = fallback.text().await;
+    assert_eq!(
+        fallback_status,
+        StatusCode::OK,
+        "`native_demo * 100` with the route off: {fallback_text}"
+    );
+    let fallback = serde_json::from_str::<PrometheusJsonResponse>(&fallback_text).unwrap();
+    assert_eq!(fallback.status, "success", "{fallback_text}");
+    assert_eq!(
+        native.data, fallback.data,
+        "the native route and the existing plan reported different results for `native_demo * 100`"
+    );
+
+    guard.remove_all().await;
+}
+
+/// The native route is the plan that ran, not merely a plan that agrees with the old one.
+///
+/// A behaviour-only test cannot tell "the route ran and answered" from "the route declined and the
+/// existing planner answered", and the second is exactly what a broken wire-up looks like. So this
+/// asks the frontend directly and reads the plan it reports back: the query has to be planned by
+/// `FusedSeriesExec`, with a child for the broadcast and without one for the scalar.
+pub async fn test_native_promql_route_plans_the_query(store_type: StorageType) {
+    let instance =
+        tests_integration::standalone::GreptimeDbStandaloneBuilder::new("promql_native_route_plan")
+            .with_default_store_type(store_type)
+            .with_query_options(QueryOptions {
+                experimental_native_promql: true,
+                ..Default::default()
+            })
+            .build()
+            .await;
+    let frontend = instance.fe_instance();
+
+    let sql = "CREATE TABLE native_demo (ts TIMESTAMP TIME INDEX, val DOUBLE, host STRING, PRIMARY KEY (host))";
+    execute_sql_and_expect(frontend, sql, "Affected Rows: 0").await;
+    let sql = "INSERT INTO native_demo(host, val, ts) VALUES ('h1', 1.0, 0), ('h1', 2.0, 1000)";
+    execute_sql_and_expect(frontend, sql, "Affected Rows: 2").await;
+
+    // A scalar statement, which reads no raw samples at all, and two shapes over the scan.
+    for query in ["1 + 2", "native_demo * 100", "-native_demo"] {
+        let plan = native_plan_of(frontend, query).await;
+        assert!(
+            plan.contains("FusedSeriesExec"),
+            "`{query}` did not reach the native route: {plan}"
+        );
+    }
+}
+
+/// The physical plan the frontend actually executed for `query`.
+async fn native_plan_of(frontend: &Arc<Instance>, query: &str) -> String {
+    let query_ctx = QueryContextBuilder::default()
+        .set_extension(
+            "query.experimental_native_promql".to_string(),
+            "true".to_string(),
+        )
+        .build();
+    let prom_query = PromQuery {
+        query: query.to_string(),
+        start: "0".to_string(),
+        end: "1000".to_string(),
+        step: "1000".to_string(),
+        ..Default::default()
+    };
+    let outputs =
+        SqlQueryHandler::do_promql_query(frontend.as_ref(), &prom_query, Arc::new(query_ctx)).await;
+    let output = outputs
+        .into_iter()
+        .next()
+        .expect("a PromQL query answers once")
+        .unwrap_or_else(|error| panic!("`{query}` failed: {error}"));
+    let plan = output
+        .meta
+        .plan
+        .expect("a PromQL query reports the plan it ran");
+    displayable(plan.as_ref()).indent(true).to_string()
 }
 
 pub async fn test_prometheus_label_replace_response(store_type: StorageType) {

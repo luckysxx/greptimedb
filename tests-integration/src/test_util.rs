@@ -59,6 +59,7 @@ use object_store::config::{
 use object_store::services::{Azblob, Gcs, Oss, S3};
 use object_store::test_util::TempFolder;
 use object_store::{AzblobConnection, GcsConnection, ObjectStore, OssConnection, S3Connection};
+use query::options::QueryOptions;
 use servers::batcher::logical_table::LogicalTablePendingRowsBatcher;
 use servers::grpc::builder::GrpcServerBuilder;
 use servers::grpc::greptime_handler::GreptimeRequestHandler;
@@ -810,17 +811,60 @@ pub async fn setup_test_prom_app_with_frontend_and_memory_limiter(
     setup_test_prom_app_with_frontend_inner(store_type, name, false, memory_limiter).await
 }
 
+/// Like [`setup_test_prom_app_with_frontend`] but with the native PromQL route enabled server-side.
+///
+/// The route is gated by both the engine option and a per-query extension, so a test that wants a
+/// query planned natively has to turn the option on here; sending the extension alone is exactly
+/// what the route's own tests use to prove a client cannot enable it against the server.
+pub async fn setup_test_prom_app_with_frontend_and_native_promql(
+    store_type: StorageType,
+    name: &str,
+) -> (Router, TestGuard) {
+    setup_test_prom_app_with_frontend_inner_with(
+        store_type,
+        name,
+        false,
+        None,
+        Some(QueryOptions {
+            experimental_native_promql: true,
+            ..Default::default()
+        }),
+    )
+    .await
+}
+
 async fn setup_test_prom_app_with_frontend_inner(
     store_type: StorageType,
     name: &str,
     enable_batcher: bool,
     memory_limiter: Option<ServerMemoryLimiter>,
 ) -> (Router, TestGuard) {
+    setup_test_prom_app_with_frontend_inner_with(
+        store_type,
+        name,
+        enable_batcher,
+        memory_limiter,
+        None,
+    )
+    .await
+}
+
+async fn setup_test_prom_app_with_frontend_inner_with(
+    store_type: StorageType,
+    name: &str,
+    enable_batcher: bool,
+    memory_limiter: Option<ServerMemoryLimiter>,
+    query_options: Option<QueryOptions>,
+) -> (Router, TestGuard) {
     unsafe {
         std::env::set_var("TZ", "UTC");
     }
 
-    let instance = setup_standalone_instance(name, store_type).await;
+    let mut builder = GreptimeDbStandaloneBuilder::new(name).with_default_store_type(store_type);
+    if let Some(options) = query_options {
+        builder = builder.with_query_options(options);
+    }
+    let instance = builder.build().await;
 
     // build physical table
     let sql = "CREATE TABLE phy (ts timestamp time index, val double, host string primary key) engine=metric with ('physical_metric_table' = '')";

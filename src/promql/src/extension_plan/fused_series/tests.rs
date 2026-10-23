@@ -69,14 +69,16 @@ use futures::{Stream, StreamExt, TryStreamExt};
 use store_api::region_engine::RawLabelSource;
 
 use super::{
-    FusedSeries, FusedSeriesBinding, LabelSets, OutputColumn, POLL_BUDGET, label_set,
-    occupied_runs, series_to_record_batch,
+    FusedExecInput, FusedSeries, FusedSeriesBinding, FusedSeriesStream, LabelSets, OutputColumn,
+    POLL_BUDGET, classify_output, label_set, occupied_runs, open_raw_series, series_stream,
+    series_to_record_batch,
 };
 use crate::evaluated::EvaluatedChunk;
 use crate::native::execute::{NativeExecutionState, NativeExecutor};
+use crate::native::metrics::NodePath;
 use crate::native::plan::{
-    AggregateKind, AggregateStage, BoundAggregate, BoundInput, BoundInstant, BoundWindow, Grouping,
-    NativeExpr, NativeNode, NativeTree, NativeType,
+    AggregateKind, AggregateStage, BoundAggregate, BoundInput, BoundInstant, BoundScalar,
+    BoundWindow, Grouping, NativeExpr, NativeNode, NativeTree, NativeType,
 };
 use crate::native::runs::absorb_rebuilds;
 use crate::range_eval::{RangeFunction, RangeWindow};
@@ -628,7 +630,7 @@ fn fused(tree: NativeTree) -> FusedSeries {
         Arc::from(PROMQL),
         tree,
         binding,
-        input_plan(frame_schema()),
+        Some(input_plan(frame_schema())),
         output_schema().to_dfschema_ref().unwrap(),
     )
     .expect("the binding matches the tree")
@@ -639,7 +641,11 @@ fn plan_of(
     node: FusedSeries,
     input: Arc<dyn ExecutionPlan>,
 ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-    node.to_execution_plan(input, RawLabelSource::Explicit, SeriesOrdering::Contiguous)
+    node.to_execution_plan(FusedExecInput::RawSeries {
+        input,
+        label_source: RawLabelSource::Explicit,
+        ordering: SeriesOrdering::Contiguous,
+    })
 }
 
 /// The physical node of `tree` over `input`.
@@ -852,7 +858,7 @@ fn zone_node() -> FusedSeries {
         Arc::from(PROMQL),
         tree,
         binding,
-        input_plan(frame_schema()),
+        Some(input_plan(frame_schema())),
         zone_output_schema().to_dfschema_ref().unwrap(),
     )
     .expect("the binding matches the tree")
@@ -873,7 +879,7 @@ fn instant_node() -> FusedSeries {
         Arc::from(PROMQL),
         tree,
         binding,
-        input_plan(frame_schema()),
+        Some(input_plan(frame_schema())),
         zone_output_schema().to_dfschema_ref().unwrap(),
     )
     .expect("the binding matches the tree")
@@ -1248,7 +1254,7 @@ fn a_tree_bound_to_another_grid_is_rejected() {
         Arc::from(PROMQL),
         tree,
         binding,
-        input_plan(frame_schema()),
+        Some(input_plan(frame_schema())),
         output_schema().to_dfschema_ref().unwrap(),
     )
     .expect_err("the tree is not evaluated on the declared grid");
@@ -1279,7 +1285,7 @@ fn a_separately_allocated_grid_with_an_equal_spec_is_accepted() {
         Arc::from(PROMQL),
         tree,
         binding,
-        input_plan(frame_schema()),
+        Some(input_plan(frame_schema())),
         output_schema().to_dfschema_ref().unwrap(),
     )
     .expect("an equal grid spec is the same grid");
@@ -2126,7 +2132,7 @@ fn two_field_node() -> FusedSeries {
         Arc::from(PROMQL),
         tree,
         binding,
-        input_plan(frame_schema_of(&two_field_schema())),
+        Some(input_plan(frame_schema_of(&two_field_schema()))),
         two_field_output_schema().to_dfschema_ref().unwrap(),
     )
     .expect("the binding matches the tree")
@@ -2792,7 +2798,7 @@ fn unequal_binding_and_output_schema_are_not_ordered_equal() {
         Arc::from(PROMQL),
         tree,
         binding(&rate_tree()),
-        input_plan(frame_schema()),
+        Some(input_plan(frame_schema())),
         nullability_changed.to_dfschema_ref().unwrap(),
     )
     .unwrap();
@@ -2879,4 +2885,420 @@ fn a_chunk_reaching_back_still_merges() {
         absorb_rebuilds() - before,
         "a chunk starting before the last stored run was appended rather than merged"
     );
+}
+
+// ---- Scalar roots and trees that read no raw samples -------------------------------
+
+/// A scalar root that reads no raw samples at all.
+fn scalar_tree(value: f64) -> NativeTree {
+    NativeTree::try_new(NativeNode {
+        expr: NativeExpr::Scalar(BoundScalar { value }),
+        output: NativeType::Scalar(grid()),
+    })
+    .expect("a scalar root is a legal tree")
+}
+
+/// The binding of a scalar root: one value column, no tags and no metric name.
+///
+/// The binding takes no tree: a tree that reads no raw samples declares no input schema to agree
+/// with, so there is nothing here to check it against.
+fn scalar_binding() -> FusedSeriesBinding {
+    FusedSeriesBinding {
+        series_schema: Arc::new(SeriesSchema {
+            fields: vec![FieldSpec {
+                name: Arc::from(VALUE),
+            }]
+            .into(),
+            eval_grid: None,
+        }),
+        grid: grid(),
+        metric_name: None,
+        time_index: TIME.to_string(),
+        tags: vec![],
+    }
+}
+
+/// The output of a scalar root: the grid timestamps and one value per point.
+fn scalar_output_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![
+        Field::new(
+            TIME,
+            DataType::Timestamp(TimeUnit::Millisecond, None),
+            false,
+        ),
+        Field::new(VALUE, DataType::Float64, true),
+    ]))
+}
+fn scalar_node(tree: NativeTree) -> FusedSeries {
+    let binding = scalar_binding();
+    FusedSeries::try_new(
+        Arc::from("1 + 2"),
+        tree,
+        binding,
+        None,
+        scalar_output_schema().to_dfschema_ref().unwrap(),
+    )
+    .expect("a scalar tree needs no child")
+}
+
+#[test]
+fn a_scalar_root_needs_no_child_and_reports_one_partition() {
+    let node = scalar_node(scalar_tree(3.0));
+    assert!(node.input().is_none());
+    assert!(node.inputs().is_empty());
+
+    let exec = node
+        .to_execution_plan(FusedExecInput::None)
+        .expect("a scalar node plans");
+    assert!(exec.children().is_empty());
+    assert_eq!(exec.properties().partitioning.partition_count(), 1);
+    assert!(exec.benefits_from_input_partitioning().iter().all(|b| !b));
+
+    // Only the one partition exists, so any other is refused rather than answered empty.
+    let context = task_context(&Arc::new(GreedyMemoryPool::new(1 << 20)));
+    assert!(exec.execute(1, context).is_err());
+}
+
+#[test]
+fn a_scalar_root_produces_the_grid_and_its_value() {
+    let exec = scalar_node(scalar_tree(3.0))
+        .to_execution_plan(FusedExecInput::None)
+        .expect("a scalar node plans");
+    let context = task_context(&Arc::new(GreedyMemoryPool::new(1 << 20)));
+    let stream = exec.execute(0, context).expect("one partition");
+    let batches: Vec<RecordBatch> =
+        futures::executor::block_on(stream.try_collect()).expect("the scalar root runs");
+    assert_eq!(batches.len(), 1, "a scalar root answers once");
+    let (times, values) = time_and_value_columns(&batches[0]);
+    assert_eq!(times, grid_rows(), "one row per grid point");
+    assert_eq!(values, vec![Some(3.0); GRID_LEN as usize]);
+
+    /// The two columns of a scalar batch: the grid timestamps and the one value at each of them.
+    fn time_and_value_columns(batch: &RecordBatch) -> (Vec<i64>, Vec<Option<f64>>) {
+        let time = batch
+            .column_by_name(TIME)
+            .expect("a scalar batch has a time column")
+            .as_any()
+            .downcast_ref::<TimestampMillisecondArray>()
+            .expect("the time column is a millisecond timestamp");
+        let value = batch
+            .column_by_name(VALUE)
+            .expect("a scalar batch has a value column")
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .expect("the value column is Float64");
+        (
+            time.values().to_vec(),
+            (0..value.len())
+                .map(|index| value.is_valid(index).then(|| value.value(index)))
+                .collect(),
+        )
+    }
+}
+
+#[test]
+fn a_scalar_root_with_a_child_is_refused_and_a_tree_with_a_child_needs_it() {
+    // The tree reads no raw samples, so a child would be scanned and dropped.
+    let tree = scalar_tree(1.0);
+    let error = FusedSeries::try_new(
+        Arc::from("1 + 2"),
+        tree,
+        scalar_binding(),
+        Some(input_plan(frame_schema())),
+        scalar_output_schema().to_dfschema_ref().unwrap(),
+    )
+    .expect_err("a child under a tree that reads nothing is a mistake");
+    assert!(
+        error.to_string().contains("does not read raw samples"),
+        "{error}"
+    );
+
+    // The reverse: a tree that reads raw samples cannot run without the plan that feeds it.
+    let error = FusedSeries::try_new(
+        Arc::from(PROMQL),
+        rate_tree(),
+        binding(&rate_tree()),
+        None,
+        output_schema().to_dfschema_ref().unwrap(),
+    )
+    .expect_err("a raw-reading tree needs its child");
+    assert!(error.to_string().contains("reads raw samples"), "{error}");
+}
+
+#[test]
+fn the_scalar_output_schema_is_the_time_and_one_value() {
+    let classification = classify_output(&scalar_output_schema(), None, &[], TIME, true)
+        .expect("a scalar output is time and value");
+    assert_eq!(classification.len(), 2);
+    assert!(matches!(classification[0], OutputColumn::Time));
+    assert!(matches!(classification[1], OutputColumn::Scalar));
+}
+
+#[test]
+fn the_scalar_output_schema_refuses_labels_fields_and_a_second_value() {
+    for (field, expected) in [
+        (Field::new(HOST, DataType::Utf8, true), "no tags"),
+        (
+            Field::new(
+                TIME,
+                DataType::Timestamp(TimeUnit::Millisecond, None),
+                false,
+            ),
+            "duplicate time column",
+        ),
+        (Field::new(VALUE, DataType::Int64, true), "must be Float64"),
+    ] {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(
+                TIME,
+                DataType::Timestamp(TimeUnit::Millisecond, None),
+                false,
+            ),
+            field,
+        ]));
+        let tags: Vec<String> = if expected == "no tags" {
+            vec![HOST.to_string()]
+        } else {
+            vec![]
+        };
+        let error = classify_output(&schema, None, &tags, TIME, true)
+            .expect_err("a scalar output has no room for this column");
+        assert!(error.to_string().contains(expected), "{error}");
+    }
+
+    // A missing value column is refused too: a time-only output reports positions, not values.
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        TIME,
+        DataType::Timestamp(TimeUnit::Millisecond, None),
+        false,
+    )]));
+    let error =
+        classify_output(&schema, None, &[], TIME, true).expect_err("a scalar needs a value column");
+    assert!(
+        error.to_string().contains("missing value column"),
+        "{error}"
+    );
+}
+
+/// The timestamps of this module's grid, which every evaluated chunk is addressed on.
+fn grid_rows() -> Vec<i64> {
+    grid()
+        .timestamps()
+        .expect("the grid materializes")
+        .iter()
+        .copied()
+        .collect()
+}
+
+// ---- Fan-in: one execution reading every child partition ----------------------------
+
+/// The production driver over `partitions` of `child`, running a samples `tree`.
+///
+/// It is [`open_raw_series`] and [`FusedSeriesStream`] - the same code the node runs - with a tree
+/// that produces samples: fetching partitions, deciding when the whole input ended and reporting a
+/// partition's error do not depend on the root's type, so an ordinary tree is what proves them.
+fn fan_in_stream(
+    tree: &NativeTree,
+    child: &Arc<dyn ExecutionPlan>,
+    partitions: Vec<usize>,
+    context: &Arc<TaskContext>,
+) -> DataFusionResult<FusedSeriesStream> {
+    let tags = [HOST.to_string(), NAME.to_string()];
+    let classification =
+        classify_output(&output_schema(), Some(&raw_schema()), &tags, TIME, false)?;
+    let input = open_raw_series(child, partitions, Some(Arc::clone(&raw_schema())), context)?;
+    // The production constructor, not a copy of its field list: attaching the label sets to the
+    // task's pool and ending an empty input are what the node does, so a test that built the stream
+    // by hand would be testing itself.
+    series_stream(
+        &Arc::new(tree.clone()),
+        0,
+        &ExecutionPlanMetricsSet::new(),
+        input,
+        Some(NodePath::root().input()),
+        classification.into(),
+        tags.into(),
+        output_schema(),
+        Arc::new(std::sync::Mutex::new(LabelSets::default())),
+        context,
+    )
+}
+
+/// Both partitions' series reach the one runtime, and the answer is not one series per partition.
+#[test]
+fn a_fan_in_reads_every_partition_into_one_runtime() {
+    let tree = rate_tree();
+    let samples = series_samples(1.0);
+    let child = memory_exec_partitioned(vec![
+        vec![frame(&series_chunk("h1", &samples, true))],
+        vec![frame(&series_chunk("h2", &samples, true))],
+    ]);
+    let context = task_context(&Arc::new(GreedyMemoryPool::new(1 << 20)));
+
+    let stream = fan_in_stream(&tree, &child, vec![0, 1], &context).expect("the fan-in opens");
+    let batches: Vec<RecordBatch> =
+        futures::executor::block_on(stream.try_collect()).expect("the fan-in runs");
+
+    let hosts = rows(&batches)
+        .into_iter()
+        .filter_map(|(_, _, host, _)| host)
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        hosts,
+        std::collections::BTreeSet::from(["h1".to_string(), "h2".to_string()]),
+        "one execution did not see both partitions' series"
+    );
+}
+
+/// One partition ending is not the end of the input: the later partition is still read.
+#[test]
+fn a_partition_ending_does_not_end_the_whole_input() {
+    let tree = rate_tree();
+    let samples = series_samples(1.0);
+    let child = memory_exec_partitioned(vec![
+        vec![frame(&series_chunk("h1", &samples, true))],
+        vec![frame(&series_chunk("h2", &samples, true))],
+    ]);
+    let context = task_context(&Arc::new(GreedyMemoryPool::new(1 << 20)));
+    let stream = fan_in_stream(&tree, &child, vec![0, 1], &context).expect("the fan-in opens");
+    let batches: Vec<RecordBatch> =
+        futures::executor::block_on(stream.try_collect()).expect("the fan-in runs");
+
+    // The first partition closed its series on the first stream. If that had ended the input, the
+    // window would have been flushed before the second series arrived and only `h1` would be here.
+    let hosts = rows(&batches)
+        .into_iter()
+        .filter_map(|(_, _, host, _)| host)
+        .collect::<std::collections::BTreeSet<_>>();
+    assert!(
+        hosts.contains("h2"),
+        "the input ended with the first partition: {hosts:?}"
+    );
+}
+
+/// A partition's failure is reported as an error, never as the end of the input.
+#[test]
+fn a_partition_error_is_not_a_normal_end() {
+    let tree = rate_tree();
+    let samples = series_samples(1.0);
+    let good = vec![frame(&series_chunk("h1", &samples, true))];
+    let child = partitioned_with_error(good);
+    let context = task_context(&Arc::new(GreedyMemoryPool::new(1 << 20)));
+    let mut stream = fan_in_stream(&tree, &child, vec![0, 1], &context).expect("the fan-in opens");
+
+    let mut answered = Vec::new();
+    let error = loop {
+        match futures::executor::block_on(stream.next()) {
+            Some(Ok(batch)) => answered.push(batch),
+            Some(Err(error)) => break error,
+            None => panic!(
+                "the failing partition ended the stream as if it were complete: {:?}",
+                rows(&answered)
+            ),
+        }
+    };
+    assert!(
+        error.to_string().contains("partition 1"),
+        "the error did not name the failing partition: {error}"
+    );
+}
+
+/// A source of `partitions` where every partition in `failing` ends with an error instead of data.
+fn partitioned_with_error(good: Vec<RecordBatch>) -> Arc<dyn ExecutionPlan> {
+    Arc::new(FailingPartitionPlan {
+        schema: frame_schema(),
+        good,
+    })
+}
+
+/// A source of two partitions, the second of which ends with an error and no batch.
+///
+/// Two partitions is what a fan-in has to read: the error has to surface while the other partition
+/// still had data, so that "the stream ended" and "a partition failed" cannot be confused.
+struct FailingPartitionPlan {
+    schema: SchemaRef,
+    good: Vec<RecordBatch>,
+}
+
+impl std::fmt::Debug for FailingPartitionPlan {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FailingPartitionPlan").finish()
+    }
+}
+
+impl DisplayAs for FailingPartitionPlan {
+    fn fmt_as(&self, _t: DisplayFormatType, f: &mut Formatter<'_>) -> fmt::Result {
+        write!(f, "FailingPartitionPlan")
+    }
+}
+
+impl ExecutionPlan for FailingPartitionPlan {
+    fn name(&self) -> &str {
+        "FailingPartitionPlan"
+    }
+
+    fn properties(&self) -> &Arc<PlanProperties> {
+        static PROPERTIES: std::sync::OnceLock<Arc<PlanProperties>> = std::sync::OnceLock::new();
+        PROPERTIES.get_or_init(|| {
+            Arc::new(PlanProperties::new(
+                EquivalenceProperties::new(frame_schema()),
+                Partitioning::UnknownPartitioning(2),
+                EmissionType::Incremental,
+                Boundedness::Bounded,
+            ))
+        })
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![]
+    }
+
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DataFusionResult<TreeNodeRecursion>,
+    ) -> DataFusionResult<TreeNodeRecursion> {
+        // The source holds no expression of its own.
+        Ok(TreeNodeRecursion::Continue)
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        _children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        Ok(self)
+    }
+
+    fn execute(
+        &self,
+        partition: usize,
+        context: Arc<TaskContext>,
+    ) -> DataFusionResult<SendableRecordBatchStream> {
+        if partition == 0 {
+            return memory_exec_with(self.schema.clone(), self.good.clone()).execute(0, context);
+        }
+        Ok(Box::pin(SingleErrorStream {
+            schema: self.schema.clone(),
+            message: format!("partition {partition} failed"),
+        }))
+    }
+}
+
+/// A stream that ends with one error and no batch.
+struct SingleErrorStream {
+    schema: SchemaRef,
+    message: String,
+}
+
+impl Stream for SingleErrorStream {
+    type Item = DataFusionResult<RecordBatch>;
+
+    fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        Poll::Ready(Some(Err(DataFusionError::Execution(self.message.clone()))))
+    }
+}
+
+impl RecordBatchStream for SingleErrorStream {
+    fn schema(&self) -> SchemaRef {
+        self.schema.clone()
+    }
 }

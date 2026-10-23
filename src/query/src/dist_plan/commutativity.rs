@@ -524,7 +524,7 @@ mod tests {
                     Arc::from("some_metric"),
                     tree,
                     binding,
-                    input,
+                    Some(input),
                     output_schema,
                 )
                 .unwrap(),
